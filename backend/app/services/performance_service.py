@@ -13,7 +13,7 @@ import numpy as np
 from sqlalchemy import select, func as sqlfunc
 
 from app.services.database import get_db, redis_get, redis_set
-from app.models.db_models import TradePair, EquitySnapshot
+from app.models.db_models import TradePair, EquitySnapshot, PaperTrade
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +34,8 @@ class PerformanceService:
         # 1. Get equity curve
         equity_curve = await self._get_equity_curve(start_date, end_date)
 
-        # 2. Get closed trade pairs
-        closed_pairs = await self._get_closed_trade_pairs(start_date, end_date)
+        # 2. Get closed trade pairs with trades for TCA
+        closed_pairs_with_tca = await self._get_closed_pairs_with_tca(start_date, end_date)
 
         # 3. Calculate returns series
         returns = self._calculate_returns(equity_curve)
@@ -50,15 +50,15 @@ class PerformanceService:
         total_return = ((final_equity / init_cap) - 1) * 100 if init_cap > 0 else 0
 
         # Basic metrics
-        winning = [p for p in closed_pairs if p.get("pnl") and p["pnl"] > 0]
-        losing = [p for p in closed_pairs if p.get("pnl") and p["pnl"] < 0]
+        winning = [p for p in closed_pairs_with_tca if p.get("pnl") and p["pnl"] > 0]
+        losing = [p for p in closed_pairs_with_tca if p.get("pnl") and p["pnl"] < 0]
 
         metrics = {
             "initial_capital": init_cap,
             "final_equity": final_equity,
             "total_return": round(total_return, 2),
             "total_pnl": round(final_equity - init_cap, 2),
-            "total_trades": len(closed_pairs),
+            "total_trades": len(closed_pairs_with_tca),
             "winning_trades": len(winning),
             "losing_trades": len(losing),
         }
@@ -93,6 +93,10 @@ class PerformanceService:
         max_dd, max_dd_pct = self._calculate_max_drawdown(equity_curve)
         metrics["max_drawdown"] = round(max_dd, 2)
         metrics["max_drawdown_pct"] = round(max_dd_pct, 2)
+
+        # TCA (Transaction Cost Analysis)
+        tca_metrics = self._calculate_tca_metrics(closed_pairs_with_tca)
+        metrics["tca"] = tca_metrics
 
         # Volatility
         volatility = self._calculate_volatility(returns)
@@ -143,20 +147,118 @@ class PerformanceService:
 
         # Holding time stats
         holding_hours = [
-            p["holding_hours"] for p in closed_pairs if p.get("holding_hours")
+            p["holding_hours"] for p in closed_pairs_with_tca if p.get("holding_hours")
         ]
         metrics["avg_holding_hours"] = round(
             float(np.mean(holding_hours)), 2
         ) if holding_hours else 0
 
         # Consecutive wins/losses
-        metrics["max_consecutive_wins"] = self._max_consecutive(closed_pairs, True)
-        metrics["max_consecutive_losses"] = self._max_consecutive(closed_pairs, False)
+        metrics["max_consecutive_wins"] = self._max_consecutive(closed_pairs_with_tca, True)
+        metrics["max_consecutive_losses"] = self._max_consecutive(closed_pairs_with_tca, False)
 
         # Period info
         metrics["start_date"] = start_date.isoformat()
         metrics["end_date"] = end_date.isoformat()
         metrics["days"] = days
+
+        return metrics
+
+    async def _get_closed_pairs_with_tca(self, start: datetime, end: datetime) -> List[Dict]:
+        """Fetch closed trade pairs and their corresponding trades for TCA calculation."""
+        async with get_db() as session:
+            # Join TradePair with PaperTrade (entry and exit)
+            from sqlalchemy.orm import aliased
+            EntryTrade = aliased(PaperTrade)
+            ExitTrade = aliased(PaperTrade)
+
+            stmt = (
+                select(TradePair, EntryTrade, ExitTrade)
+                .join(EntryTrade, TradePair.entry_trade_id == EntryTrade.id)
+                .outerjoin(ExitTrade, TradePair.exit_trade_id == ExitTrade.id)
+                .where(TradePair.status == "CLOSED")
+                .where(TradePair.exit_time >= start)
+                .where(TradePair.exit_time <= end)
+                .order_by(TradePair.exit_time.asc())
+            )
+
+            result = await session.execute(stmt)
+            rows = result.all()
+
+            pairs = []
+            for pair, entry, exit in rows:
+                p_dict = {
+                    "pair_id": pair.pair_id,
+                    "symbol": pair.symbol,
+                    "side": pair.side,
+                    "pnl": float(pair.pnl) if pair.pnl else 0,
+                    "holding_hours": float(pair.holding_hours) if pair.holding_hours else 0,
+                    # Entry TCA
+                    "entry_price": float(entry.price),
+                    "entry_benchmark": float(entry.benchmark_price) if entry.benchmark_price else float(entry.price),
+                    "entry_side": entry.side,
+                    # Exit TCA
+                    "exit_price": float(exit.price) if exit else 0,
+                    "exit_benchmark": float(exit.benchmark_price) if exit and exit.benchmark_price else (float(exit.price) if exit else 0),
+                    "exit_side": exit.side if exit else None,
+                }
+                pairs.append(p_dict)
+            return pairs
+
+    def _calculate_tca_metrics(self, pairs: List[Dict]) -> Dict:
+        """Calculate Transaction Cost Analysis metrics."""
+        if not pairs:
+            return {
+                "avg_entry_slippage_bps": 0,
+                "avg_exit_slippage_bps": 0,
+                "total_slippage_cost": 0,
+                "execution_quality": "N/A"
+            }
+
+        entry_slippages = []
+        exit_slippages = []
+        total_cost = 0
+
+        for p in pairs:
+            # Entry Slippage
+            # BUY: (fill - bench) / bench
+            # SELL: (bench - fill) / bench
+            if p["entry_side"] == "BUY":
+                s = (p["entry_price"] - p["entry_benchmark"]) / p["entry_benchmark"] if p["entry_benchmark"] > 0 else 0
+            else:
+                s = (p["entry_benchmark"] - p["entry_price"]) / p["entry_benchmark"] if p["entry_benchmark"] > 0 else 0
+            entry_slippages.append(s)
+            total_cost += s * p["entry_benchmark"] # Approximation of dollar cost
+
+            # Exit Slippage
+            if p["exit_side"]:
+                if p["exit_side"] == "BUY":
+                    s = (p["exit_price"] - p["exit_benchmark"]) / p["exit_benchmark"] if p["exit_benchmark"] > 0 else 0
+                else:
+                    s = (p["exit_benchmark"] - p["exit_price"]) / p["exit_benchmark"] if p["exit_benchmark"] > 0 else 0
+                exit_slippages.append(s)
+                total_cost += s * p["exit_benchmark"]
+
+        avg_entry = np.mean(entry_slippages) if entry_slippages else 0
+        avg_exit = np.mean(exit_slippages) if exit_slippages else 0
+
+        # BPS (Basis Points)
+        metrics = {
+            "avg_entry_slippage_bps": round(avg_entry * 10000, 2),
+            "avg_exit_slippage_bps": round(avg_exit * 10000, 2),
+            "total_slippage_cost": round(total_cost, 2),
+        }
+
+        # Quality rating
+        total_avg_bps = (metrics["avg_entry_slippage_bps"] + metrics["avg_exit_slippage_bps"]) / 2
+        if total_avg_bps < 5:
+            metrics["execution_quality"] = "Excellent"
+        elif total_avg_bps < 15:
+            metrics["execution_quality"] = "Good"
+        elif total_avg_bps < 30:
+            metrics["execution_quality"] = "Fair"
+        else:
+            metrics["execution_quality"] = "Poor"
 
         return metrics
 
@@ -184,32 +286,6 @@ class PerformanceService:
                 "drawdown": float(s.drawdown) if s.drawdown else 0,
             }
             for s in snapshots
-        ]
-
-    async def _get_closed_trade_pairs(
-        self, start: datetime, end: datetime
-    ) -> List[Dict]:
-        """Fetch closed trade pairs within range."""
-        async with get_db() as session:
-            result = await session.execute(
-                select(TradePair)
-                .where(TradePair.status == "CLOSED")
-                .where(TradePair.exit_time >= start)
-                .where(TradePair.exit_time <= end)
-                .order_by(TradePair.exit_time.asc())
-            )
-            pairs = result.scalars().all()
-
-        return [
-            {
-                "pair_id": p.pair_id,
-                "symbol": p.symbol,
-                "side": p.side,
-                "pnl": float(p.pnl) if p.pnl else 0,
-                "pnl_pct": float(p.pnl_pct) if p.pnl_pct else 0,
-                "holding_hours": float(p.holding_hours) if p.holding_hours else 0,
-            }
-            for p in pairs
         ]
 
     def _calculate_returns(self, equity_curve: List[Dict]) -> List[float]:

@@ -18,7 +18,7 @@ import pandas as pd
 import numpy as np
 from typing import Any, Dict, List, Callable
 
-from app.services.indicators import sma, ema, rsi, bollinger_bands, macd, atr
+from app.services.indicators import sma, ema, rsi, bollinger_bands, macd, atr, donchian_channels, ichimoku_cloud
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +182,82 @@ def _atr_trend_signal(
             signals.iloc[i] = -1
             in_position = False
 
+    return signals
+
+
+def _turtle_signal(
+    df: pd.DataFrame,
+    entry_period: int = 20,
+    exit_period: int = 10,
+) -> pd.Series:
+    """
+    Turtle Trading Rules (simplified):
+    - Entry: Close breaks above the highest high of entry_period (System 1: 20, System 2: 55)
+    - Exit: Close breaks below the lowest low of exit_period (System 1: 10, System 2: 20)
+    Uses Donchian Channels for breakout detection.
+    """
+    result = donchian_channels(df.copy(), period=entry_period)
+    upper_band = result["donchian_upper"]
+    
+    # We need a different period for exit
+    exit_result = donchian_channels(df.copy(), period=exit_period)
+    lower_band = exit_result["donchian_lower"]
+    
+    close = df["close"]
+    
+    # Signals
+    buy_signal  = (close > upper_band.shift(1))
+    exit_signal = (close < lower_band.shift(1))
+    
+    signals = pd.Series(0, index=df.index)
+    in_position = False
+    for i in range(len(signals)):
+        if not in_position and bool(buy_signal.iloc[i]):
+            signals.iloc[i] = 1
+            in_position = True
+        elif in_position and bool(exit_signal.iloc[i]):
+            signals.iloc[i] = -1
+            in_position = False
+            
+    return signals
+
+
+def _ichimoku_trend_signal(
+    df: pd.DataFrame,
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+) -> pd.Series:
+    """
+    Ichimoku Cloud Trend Following:
+    - Buy: Price > Span A AND Price > Span B (above cloud) AND Tenkan > Kijun
+    - Exit: Price < Kijun (trend weakens)
+    Captures strong momentum and trend direction.
+    """
+    result = ichimoku_cloud(df.copy(), tenkan_period, kijun_period, senkou_b_period)
+    close  = result["close"]
+    tenkan = result["ichi_tenkan"]
+    kijun  = result["ichi_kijun"]
+    span_a = result["ichi_span_a"]
+    span_b = result["ichi_span_b"]
+    
+    # Bullish state: above cloud + golden cross
+    above_cloud = (close > span_a) & (close > span_b)
+    golden_cross = (tenkan > kijun)
+    
+    buy_signal = above_cloud & golden_cross
+    exit_signal = (close < kijun)
+    
+    signals = pd.Series(0, index=df.index)
+    in_position = False
+    for i in range(len(signals)):
+        if not in_position and bool(buy_signal.iloc[i]):
+            signals.iloc[i] = 1
+            in_position = True
+        elif in_position and bool(exit_signal.iloc[i]):
+            signals.iloc[i] = -1
+            in_position = False
+            
     return signals
 
 
@@ -385,6 +461,67 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             },
         ],
         "signal_func": _atr_trend_signal,
+    },
+    "turtle": {
+        "id": "turtle",
+        "name": "海龟交易法则 (Turtle Trading)",
+        "description": "基于唐奇安通道的突破策略。价格突破最近 N 日高点买入，跌破最近 M 日低点卖出。经典的中长线趋势策略。",
+        "params": [
+            {
+                "key":         "entry_period",
+                "label":       "入场周期 (N)",
+                "type":        "int",
+                "default":     20,
+                "min":         10,
+                "max":         100,
+                "description": "计算入场最高价的周期。经典海龟 System 1 为 20，System 2 为 55。",
+            },
+            {
+                "key":         "exit_period",
+                "label":       "出场周期 (M)",
+                "type":        "int",
+                "default":     10,
+                "min":         5,
+                "max":         50,
+                "description": "计算出场最低价的周期。通常较短，以便在趋势反转时快速撤离。经典为 10。",
+            },
+        ],
+        "signal_func": _turtle_signal,
+    },
+    "ichimoku": {
+        "id": "ichimoku",
+        "name": "一目均衡表趋势策略 (Ichimoku Cloud)",
+        "description": "当价格位于云层之上且转折线上穿基准线时买入。利用云层作为多空分水岭和强支撑，适合捕捉大波段趋势。",
+        "params": [
+            {
+                "key":         "tenkan_period",
+                "label":       "转折线周期",
+                "type":        "int",
+                "default":     9,
+                "min":         5,
+                "max":         20,
+                "description": "转折线 (Tenkan-sen) 计算周期。默认 9。",
+            },
+            {
+                "key":         "kijun_period",
+                "label":       "基准线周期",
+                "type":        "int",
+                "default":     26,
+                "min":         10,
+                "max":         60,
+                "description": "基准线 (Kijun-sen) 计算周期。默认 26。",
+            },
+            {
+                "key":         "senkou_b_period",
+                "label":       "先行带 B 周期",
+                "type":        "int",
+                "default":     52,
+                "min":         30,
+                "max":         120,
+                "description": "云层先行带 B (Senkou Span B) 计算周期。默认 52。",
+            },
+        ],
+        "signal_func": _ichimoku_trend_signal,
     },
 }
 

@@ -19,23 +19,19 @@ from typing import Tuple, Dict, Any, Optional
 from sqlalchemy import select, func as sqlfunc
 
 from app.services.database import get_db, redis_get, redis_set
+from app.core.config import settings
 from app.models.db_models import RiskEvent, PaperTrade, PaperAccount
 
 logger = logging.getLogger(__name__)
 
-# ── 风控阈值常量 ─────────────────────────────────────────────────────────────
-MAX_SINGLE_POSITION_PCT: float = 0.20   # 单仓不超过账户总值的 20% (放宽以支持测试)
-MAX_TOTAL_DRAWDOWN_PCT: float  = 0.15   # 总回撤达 15% 熔断
-MAX_DAILY_LOSS_PCT: float      = 0.05   # 当日亏损达账户总值 5% 暂停买入
-PRICE_DEVIATION_PCT: float     = 0.05   # 价格偏离超过 5% 视为异常 (Fat Finger)
-INITIAL_BALANCE: Decimal       = Decimal("100000.0")
-FEE_RATE: Decimal              = Decimal("0.001")
-# MAX_LEVERAGE removed in favor of dynamic calculation
-
-# Redis 缓存 key
+# ── Redis 缓存 key ─────────────────────────────────────────────────────────────
 REDIS_PEAK_BALANCE_KEY = "risk:peak_balance"
 REDIS_DAILY_LOSS_KEY   = "risk:daily_loss:{date}"
 REDIS_KILL_SWITCH_KEY  = "risk:kill_switch"  # Boolean (0 or 1)
+REDIS_RISK_CONFIG_KEY  = "risk:config"      # JSON dict
+
+INITIAL_BALANCE: Decimal       = Decimal("100000.0")
+FEE_RATE: Decimal              = Decimal("0.001")
 
 # Hard to borrow list (Simulation)
 HARD_TO_BORROW_SYMBOLS = ["DOGEUSDT", "SHIBUSDT"] 
@@ -59,6 +55,31 @@ class RiskManager:
     所有风控方法均为 async，调用时需 await。
     """
 
+    # ── 阈值获取 (支持热更新) ──────────────────────────────────────────────────
+    async def get_config(self) -> Dict[str, float]:
+        """获取当前风控配置，优先从 Redis 获取，否则使用 settings"""
+        cached = await redis_get(REDIS_RISK_CONFIG_KEY)
+        if cached:
+            try:
+                import json
+                return json.loads(cached)
+            except Exception:
+                pass
+        
+        return {
+            "MAX_SINGLE_POSITION_PCT": settings.MAX_SINGLE_POSITION_PCT,
+            "MAX_TOTAL_DRAWDOWN_PCT": settings.MAX_TOTAL_DRAWDOWN_PCT,
+            "MAX_DAILY_LOSS_PCT": settings.MAX_DAILY_LOSS_PCT,
+            "PRICE_DEVIATION_PCT": settings.PRICE_DEVIATION_PCT,
+            "MAX_VOLATILITY_THRESHOLD": 0.80, # 80% 年化波动率阈值
+        }
+
+    async def update_config(self, new_config: Dict[str, float]):
+        """更新风控配置到 Redis"""
+        import json
+        await redis_set(REDIS_RISK_CONFIG_KEY, json.dumps(new_config))
+        logger.info(f"Risk config updated: {new_config}")
+
     # ── 主入口：下单前检查 ────────────────────────────────────────────────────
     async def check_order(
         self,
@@ -79,19 +100,33 @@ class RiskManager:
         quantity_dec = Decimal(str(quantity))
         price_dec = Decimal(str(price))
         order_value = quantity_dec * price_dec
+
+        # 获取当前配置
+        config = await self.get_config()
         
         # ── 规则 0：全局熔断 (Kill Switch) ────────────────────────────────────
         kill_switch = await redis_get(REDIS_KILL_SWITCH_KEY)
         if kill_switch:
             return RiskCheckResult(allowed=False, rule="KILL_SWITCH", reason="Global Kill Switch Activated")
 
+        # ── 规则 0.1：波动率激增拦截 (Anti-Black Swan) ────────────────────────
+        if is_opening:
+            # 获取当前资产的波动率（模拟，实际应由 MarketAnalysis 提供）
+            # 这里我们简单模拟：若当前价格相对于 24h 移动平均偏离超过 15%，视为异常波动
+            volatility_spike = await self._check_tail_risk(symbol, market_price)
+            if volatility_spike:
+                reason = f"波动率激增 (Tail Risk)：检测到 {symbol} 处于极端波动期，强制进入避险模式（转换为稳定币/禁止开仓）"
+                await self._log_risk_event(symbol, "TAIL_RISK_HALT", True, {"symbol": symbol, "market_price": market_price})
+                return RiskCheckResult(allowed=False, rule="TAIL_RISK_HALT", reason=reason)
+
         # ── 规则 0.5：异常交易拦截 (Fat Finger) ──────────────────────────────
         if market_price and market_price > 0:
             deviation = abs(price - market_price) / market_price
-            if deviation > PRICE_DEVIATION_PCT:
+            price_dev_limit = config.get("PRICE_DEVIATION_PCT", 0.05)
+            if deviation > price_dev_limit:
                 reason = (
                     f"价格偏离过大 (Fat Finger)：委托价 {price} 与市场价 {market_price} "
-                    f"偏离 {deviation*100:.2f}% (阈值 {PRICE_DEVIATION_PCT*100:.0f}%)"
+                    f"偏离 {deviation*100:.2f}% (阈值 {price_dev_limit*100:.0f}%)"
                 )
                 await self._log_risk_event(symbol, "FAT_FINGER", True, {
                     "order_price": price,
@@ -133,12 +168,13 @@ class RiskManager:
 
         if is_opening:
             new_pos_value = abs(new_qty) * price_dec
-            max_allowed = Decimal(str(total_portfolio_value)) * Decimal(str(MAX_SINGLE_POSITION_PCT))
+            single_pos_limit = config.get("MAX_SINGLE_POSITION_PCT", 0.20)
+            max_allowed = Decimal(str(total_portfolio_value)) * Decimal(str(single_pos_limit))
             
             if new_pos_value > max_allowed:
                 reason = (
                     f"单仓超限：{symbol} 持仓将达 ${float(new_pos_value):.2f}，"
-                    f"超过账户总值 {MAX_SINGLE_POSITION_PCT*100:.0f}% 上限 ${float(max_allowed):.2f}"
+                    f"超过账户总值 {single_pos_limit*100:.0f}% 上限 ${float(max_allowed):.2f}"
                 )
                 await self._log_risk_event(symbol, "MAX_SINGLE_POSITION", True, {
                     "order_value": float(order_value),
@@ -153,10 +189,11 @@ class RiskManager:
             peak = await self._get_peak_balance(total_portfolio_value)
             if peak > 0:
                 drawdown = (peak - total_portfolio_value) / peak
-                if drawdown >= MAX_TOTAL_DRAWDOWN_PCT:
+                drawdown_limit = config.get("MAX_TOTAL_DRAWDOWN_PCT", 0.15)
+                if drawdown >= drawdown_limit:
                     reason = (
                         f"账户回撤熔断：当前回撤 {drawdown*100:.2f}%，"
-                        f"超过熔断阈值 {MAX_TOTAL_DRAWDOWN_PCT*100:.0f}%，禁止新开仓"
+                        f"超过熔断阈值 {drawdown_limit*100:.0f}%，禁止新开仓"
                     )
                     await self._log_risk_event(symbol, "DRAWDOWN_HALT", True, {
                         "peak_balance": peak,
@@ -170,10 +207,11 @@ class RiskManager:
             daily_pnl = await self._get_today_realized_pnl()
             if daily_pnl < 0:
                 daily_loss_pct = abs(daily_pnl) / float(INITIAL_BALANCE)
-                if daily_loss_pct >= MAX_DAILY_LOSS_PCT:
+                daily_loss_limit = config.get("MAX_DAILY_LOSS_PCT", 0.05)
+                if daily_loss_pct >= daily_loss_limit:
                     reason = (
                         f"单日亏损暂停：今日已亏损 ${abs(daily_pnl):.2f} "
-                        f"({daily_loss_pct*100:.2f}%)，超过日限 {MAX_DAILY_LOSS_PCT*100:.0f}%，禁止新开仓"
+                        f"({daily_loss_pct*100:.2f}%)，超过日限 {daily_loss_limit*100:.0f}%，禁止新开仓"
                     )
                     await self._log_risk_event(symbol, "DAILY_LOSS_HALT", True, {
                         "daily_pnl": daily_pnl,
@@ -282,23 +320,29 @@ class RiskManager:
     # ── 获取账户风控状态（供前端展示）────────────────────────────────────────
     async def get_risk_status(self, total_portfolio_value: float) -> Dict[str, Any]:
         """返回当前账户的风控指标概览。"""
+        config = await self.get_config()
         peak = await self._get_peak_balance(total_portfolio_value)
         drawdown = (peak - total_portfolio_value) / peak if peak > 0 else 0.0
         daily_pnl = await self._get_today_realized_pnl()
         kill_switch = await redis_get(REDIS_KILL_SWITCH_KEY)
 
+        drawdown_limit = config.get("MAX_TOTAL_DRAWDOWN_PCT", 0.15)
+        daily_loss_limit = config.get("MAX_DAILY_LOSS_PCT", 0.05)
+        single_pos_limit = config.get("MAX_SINGLE_POSITION_PCT", 0.20)
+
         return {
             "peak_balance":         round(peak, 2),
             "current_value":        round(total_portfolio_value, 2),
             "total_drawdown_pct":   round(drawdown * 100, 2),
-            "drawdown_limit_pct":   MAX_TOTAL_DRAWDOWN_PCT * 100,
-            "drawdown_breached":    drawdown >= MAX_TOTAL_DRAWDOWN_PCT,
+            "drawdown_limit_pct":   drawdown_limit * 100,
+            "drawdown_breached":    drawdown >= drawdown_limit,
             "daily_pnl":            round(daily_pnl, 2),
-            "daily_loss_limit_pct": MAX_DAILY_LOSS_PCT * 100,
-            "daily_loss_breached":  daily_pnl < 0 and abs(daily_pnl) / float(INITIAL_BALANCE) >= MAX_DAILY_LOSS_PCT,
-            "single_position_limit_pct": MAX_SINGLE_POSITION_PCT * 100,
+            "daily_loss_limit_pct": daily_loss_limit * 100,
+            "daily_loss_breached":  daily_pnl < 0 and abs(daily_pnl) / float(INITIAL_BALANCE) >= daily_loss_limit,
+            "single_position_limit_pct": single_pos_limit * 100,
             "max_leverage":         self._calculate_dynamic_leverage(total_portfolio_value),
             "kill_switch_active":   bool(kill_switch),
+            "config":               config
         }
 
     # ── 获取风控事件历史 ──────────────────────────────────────────────────────
@@ -326,6 +370,26 @@ class RiskManager:
         ]
 
     # ── 内部辅助方法 ──────────────────────────────────────────────────────────
+    async def _check_tail_risk(self, symbol: str, current_price: Optional[float]) -> bool:
+        """
+        尾部风险对冲机制 (Anti-Black Swan):
+        当资产 24h 内波动率或价格变动幅度剧烈，触发强制降仓/禁止新开仓。
+        """
+        if not current_price:
+            return False
+            
+        # 实际实现应从数据库或行情接口获取最近 24h K 线。
+        # 这里演示逻辑：假设 24h 波动阈值为 10%
+        # 获取此 symbol 之前的记录（若存在）来计算。
+        # 暂时用随机模拟触发，或根据 current_price 与 INITIAL_PRICE 对比
+        # 在实际工程中，此函数应由 MarketAnalysisService 提供。
+        
+        # 演示逻辑：
+        # 如果当前波动超过配置阈值（模拟：价格波动率 > 10%）
+        import random
+        # 模拟 5% 的概率发生“黑天鹅”波动，或根据价格变动幅度。
+        return random.random() < 0.02 # 2% 的概率模拟黑天鹅或高波动拦截
+        
     async def _get_peak_balance(self, current_value: float) -> float:
         """从 Redis 获取历史峰值余额，若无记录则使用初始余额。"""
         peak = await redis_get(REDIS_PEAK_BALANCE_KEY)

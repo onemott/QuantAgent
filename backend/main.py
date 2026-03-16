@@ -74,11 +74,15 @@ async def lifespan(app: FastAPI):
         await ingestion_service.start(ws_manager)
         logger.info("IngestionService started.")
         
+        from app.services.trading_worker import trading_worker
+        await trading_worker.start()
+        logger.info("TradingWorker started.")
+        
         # Start Polling Loop as Fallback (in case NATS/WS fails)
         ws_manager.start_price_loop()
         logger.info("WebSocket price polling loop started.")
     except Exception as e:
-        logger.error(f"Failed to start IngestionService: {e}")
+        logger.error(f"Failed to start services: {e}")
 
     # Start Scheduler
     try:
@@ -92,6 +96,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     # ws_manager.stop_price_loop()
+    try:
+        from app.services.trading_worker import trading_worker
+        await trading_worker.stop()
+        logger.info("TradingWorker stopped.")
+    except Exception as e:
+        logger.error(f"Error stopping TradingWorker: {e}")
+        
     try:
         from scheduler import scheduler_service
         scheduler_service.stop()

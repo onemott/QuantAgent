@@ -234,3 +234,91 @@ class OptunaOptimizer:
             "best_sharpe": best_value,
             "results": trials
         }
+
+class WalkForwardOptimizer:
+    """
+    Walk-Forward Optimization (WFO).
+    Splits data into rolling In-Sample (IS) and Out-of-Sample (OOS) windows.
+    Optimizes parameters on IS and validates on OOS to prevent overfitting.
+    """
+    def __init__(self, df: pd.DataFrame, strategy_type: str, initial_capital: float = 10000.0):
+        self.df = df
+        self.strategy_type = strategy_type
+        self.initial_capital = initial_capital
+
+    async def run_wfo(
+        self, 
+        is_days: int = 180, 
+        oos_days: int = 60, 
+        n_trials: int = 30,
+        use_numba: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Run WFO across the entire dataset.
+        """
+        if self.df.empty:
+            return {"error": "Empty dataframe"}
+
+        # Calculate windows
+        results = []
+        start_date = self.df.index.min()
+        end_date = self.df.index.max()
+        
+        current_is_start = start_date
+        
+        while True:
+            current_is_end = current_is_start + pd.Timedelta(days=is_days)
+            current_oos_end = current_is_end + pd.Timedelta(days=oos_days)
+            
+            if current_oos_end > end_date:
+                break
+                
+            # IS Optimization
+            is_df = self.df.loc[current_is_start:current_is_end]
+            if len(is_df) < 20: # Minimum data requirement
+                current_is_start += pd.Timedelta(days=oos_days)
+                continue
+                
+            opt = OptunaOptimizer(is_df, self.strategy_type, self.initial_capital)
+            # Run optuna in thread to avoid blocking
+            opt_res = await asyncio.to_thread(opt.optimize, n_trials=n_trials, use_numba=use_numba)
+            best_params = opt_res["best_params"]
+            
+            # OOS Validation
+            oos_df = self.df.loc[current_is_end:current_oos_end]
+            if oos_df.empty:
+                break
+                
+            from app.services.strategy_templates import build_signal_func
+            from app.services.backtester.vectorized import VectorizedBacktester
+            
+            signal_func = build_signal_func(self.strategy_type, best_params)
+            bt = VectorizedBacktester(oos_df, signal_func, self.initial_capital)
+            oos_perf = bt.run()
+            
+            results.append({
+                "is_period": [current_is_start.isoformat(), current_is_end.isoformat()],
+                "oos_period": [current_is_end.isoformat(), current_oos_end.isoformat()],
+                "best_params": best_params,
+                "is_sharpe": opt_res["best_sharpe"],
+                "oos_sharpe": oos_perf.get("sharpe_ratio", 0.0),
+                "oos_return": oos_perf.get("total_return", 0.0),
+                "oos_drawdown": oos_perf.get("max_drawdown", 0.0)
+            })
+            
+            # Roll forward
+            current_is_start += pd.Timedelta(days=oos_days)
+
+        # Aggregated performance
+        avg_oos_sharpe = np.mean([r["oos_sharpe"] for r in results]) if results else 0.0
+        total_oos_return = np.sum([r["oos_return"] for r in results]) if results else 0.0
+        
+        return {
+            "strategy": self.strategy_type,
+            "walk_forward_results": results,
+            "metrics": {
+                "avg_oos_sharpe": round(avg_oos_sharpe, 2),
+                "total_oos_return": round(total_oos_return, 4),
+                "num_windows": len(results)
+            }
+        }

@@ -257,6 +257,101 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────
+# DONCHIAN  唐奇安通道
+# ──────────────────────────────────────────────────────────
+def donchian_channels(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
+    """
+    唐奇安通道 (Donchian Channels)
+
+    计算公式：
+        上轨 (Upper) = 最近 n 个周期的最高价的最高值
+        下轨 (Lower) = 最近 n 个周期的最低价的最低值
+        中轨 (Middle) = (上轨 + 下轨) / 2
+
+    参数：
+        df     : OHLCV DataFrame
+        period : 计算周期，海龟交易法常用 20 或 55
+
+    返回：
+        df 副本，新增列：donchian_upper, donchian_lower, donchian_mid
+
+    用途：
+        - 突破交易：价格突破上轨为买入信号，突破下轨为卖出/止损信号。
+        - 波动率评估：通道宽度反映市场波动范围。
+    """
+    result = df.copy()
+    result["donchian_upper"] = result["high"].rolling(window=period).max()
+    result["donchian_lower"] = result["low"].rolling(window=period).min()
+    result["donchian_mid"] = (result["donchian_upper"] + result["donchian_lower"]) / 2
+    return result
+
+
+# ──────────────────────────────────────────────────────────
+# ICHIMOKU  一目均衡表
+# ──────────────────────────────────────────────────────────
+def ichimoku_cloud(
+    df: pd.DataFrame, tenkan_period: int = 9, kijun_period: int = 26, senkou_b_period: int = 52, displacement: int = 26
+) -> pd.DataFrame:
+    """
+    一目均衡表 (Ichimoku Cloud / Ichimoku Kinko Hyo)
+
+    包含五条线：
+        1. 转折线 (Tenkan-sen): (9周期高 + 9周期低) / 2
+        2. 基准线 (Kijun-sen): (26周期高 + 26周期低) / 2
+        3. 先行带 A (Senkou Span A): (转折线 + 基准线) / 2，向前平移 26 周期
+        4. 先行带 B (Senkou Span B): (52周期高 + 52周期低) / 2，向前平移 26 周期
+        5. 迟行带 (Chikou Span): 当期收盘价，向后平移 26 周期
+
+    参数：
+        df              : OHLCV DataFrame
+        tenkan_period   : 转折线周期 (默认 9)
+        kijun_period    : 基准线周期 (默认 26)
+        senkou_b_period : 先行带 B 周期 (默认 52)
+        displacement    : 平移周期 (默认 26)
+
+    返回：
+        df 副本，新增列：ichi_tenkan, ichi_kijun, ichi_span_a, ichi_span_b, ichi_chikou
+
+    交易含义：
+        - 云层 (Cloud/Kumo): 由 Span A 和 Span B 围成，作为强支撑/压力区。
+        - 价格在云上为看多，云下为看空。
+        - 转折线上穿基准线（金叉）为买入参考。
+    """
+    result = df.copy()
+    high = result["high"]
+    low = result["low"]
+    close = result["close"]
+
+    # 1. Tenkan-sen
+    nine_high = high.rolling(window=tenkan_period).max()
+    nine_low = low.rolling(window=tenkan_period).min()
+    result["ichi_tenkan"] = (nine_high + nine_low) / 2
+
+    # 2. Kijun-sen
+    twenty_six_high = high.rolling(window=kijun_period).max()
+    twenty_six_low = low.rolling(window=kijun_period).min()
+    result["ichi_kijun"] = (twenty_six_high + twenty_six_low) / 2
+
+    # 3. Senkou Span A (Leading Span A)
+    # Plotted displacement periods ahead
+    span_a = (result["ichi_tenkan"] + result["ichi_kijun"]) / 2
+    result["ichi_span_a"] = span_a.shift(displacement)
+
+    # 4. Senkou Span B (Leading Span B)
+    # Plotted displacement periods ahead
+    fifty_two_high = high.rolling(window=senkou_b_period).max()
+    fifty_two_low = low.rolling(window=senkou_b_period).min()
+    span_b = (fifty_two_high + fifty_two_low) / 2
+    result["ichi_span_b"] = span_b.shift(displacement)
+
+    # 5. Chikou Span (Lagging Span)
+    # Plotted displacement periods behind
+    result["ichi_chikou"] = close.shift(-displacement)
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────
 # 批量计算所有指标（演示用）
 # ──────────────────────────────────────────────────────────
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:

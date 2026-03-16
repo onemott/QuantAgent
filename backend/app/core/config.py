@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # CoinGecko API
     COINGECKO_API_KEY: str = ""
     
+    # Risk Management (Phase B Hot Reload)
+    MAX_SINGLE_POSITION_PCT: float = 0.20
+    MAX_TOTAL_DRAWDOWN_PCT: float = 0.15
+    MAX_DAILY_LOSS_PCT: float = 0.05
+    PRICE_DEVIATION_PCT: float = 0.05
+    
     # Proxy Settings
     HTTP_PROXY: str = ""
     HTTPS_PROXY: str = ""
