@@ -1,0 +1,167 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: quantagent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: quantagent
+      POSTGRES_PASSWORD: quantagent
+      POSTGRES_DB: quantagent
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantagent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - quantagent-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: quantagent-redis
+    restart: unless-stopped
+    ports:
+      - "6382:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - quantagent-network
+
+  # ClickHouse — Time-Series Analytics (K-line history, backtest data)
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    container_name: quantagent-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8124:8123"   # HTTP interface
+      - "9001:9000"   # Native TCP interface
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    # Note: ClickHouse health check disabled - service starts successfully without it
+    # The backend will handle connection retries gracefully
+    networks:
+      - quantagent-network
+
+  # NATS — Message Queue for market data pub/sub (Phase B)
+  nats:
+    image: nats:2.10-alpine
+    container_name: quantagent-nats
+    restart: unless-stopped
+    ports:
+      - "4223:4222"   # Client connections
+      - "8223:8222"   # HTTP monitoring
+    command: ["-m", "8222", "--jetstream"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - quantagent-network
+
+  # Go Gateway (NATS Publisher & Order Executor)
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: quantagent-gateway
+    restart: unless-stopped
+    environment:
+      - NATS_URL=nats://nats:4222
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
+      - BINANCE_TESTNET=true
+      - SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT
+      - BINANCE_PROXY=http://host.docker.internal:7897
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - quantagent-network
+
+  # Backend API (FastAPI)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: quantagent-backend
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://quantagent:quantagent@postgres:5432/quantagent
+      - REDIS_URL=redis://redis:6379/0
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=quantagent
+      - NATS_URL=nats://nats:4222
+      - DEBUG=true
+      - HOST=0.0.0.0
+      - PORT=8000
+      # 代理仅用于外部 API，Ollama 本地服务不走代理
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      # Ollama 使用 host-gateway 直接访问宿主机
+      - OLLAMA_BASE_URL=http://host-gateway:11434
+      - LLM_PROVIDER=ollama
+      # 禁用 Ollama 请求的代理
+      - OLLAMA_NO_PROXY=true
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+    networks:
+      - quantagent-network
+    # 添加 host-gateway 映射，使容器能访问宿主机 Ollama
+    extra_hosts:
+      - "host-gateway:host-gateway"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./frontend/my-app
+      dockerfile: Dockerfile
+    container_name: quantagent-frontend
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8002/ws/market
+    volumes:
+      - ./frontend/my-app:/app
+    depends_on:
+      - backend
+    networks:
+      - quantagent-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  clickhouse_data:
+
+networks:
+  quantagent-network:
+    driver: bridge
