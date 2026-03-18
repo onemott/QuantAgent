@@ -191,6 +191,13 @@ async def get_risk_status():
     return await risk_manager.get_risk_status(total_portfolio)
 
 
+@router.get("/macro-status")
+async def get_macro_status(symbol: str = "BTCUSDT"):
+    """获取当前宏观经济与链上指标状态 (Smart Beta & Anti-Black Swan)"""
+    from app.services.macro_analysis_service import macro_analysis_service
+    return await macro_analysis_service.get_macro_score(symbol)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────

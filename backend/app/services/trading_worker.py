@@ -35,7 +35,7 @@ class TradingWorker:
                 settings.NATS_URL,
                 name="quantagent-trading-worker",
                 reconnect_time_wait=2,
-                max_reconnect_attempts=None,
+                max_reconnect_attempts=-1,
                 connect_timeout=5
             )
             logger.info("TradingWorker NATS connected.")
@@ -69,6 +69,7 @@ class TradingWorker:
             price = data.get("price")
             order_type = data.get("order_type", "MARKET")
             client_order_id = data.get("client_order_id")
+            strategy_id = data.get("strategy_id") # Extract strategy_id from signal
 
             if not all([symbol, side, quantity, price]):
                 logger.warning(f"Invalid signal payload: {data}")
@@ -85,7 +86,8 @@ class TradingWorker:
                     quantity=quantity,
                     price=price,
                     order_type=order_type,
-                    client_order_id=client_order_id
+                    client_order_id=client_order_id,
+                    strategy_id=strategy_id # Pass strategy_id
                 )
                 logger.info(f"Trade executed successfully: {result['order_id']}")
 

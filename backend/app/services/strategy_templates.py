@@ -19,6 +19,7 @@ import numpy as np
 from typing import Any, Dict, List, Callable
 
 from app.services.indicators import sma, ema, rsi, bollinger_bands, macd, atr, donchian_channels, ichimoku_cloud
+from app.services.macro_analysis_service import macro_analysis_service
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,6 +259,75 @@ def _ichimoku_trend_signal(
             signals.iloc[i] = -1
             in_position = False
             
+    return signals
+
+
+async def _smart_beta_signal(
+    df: pd.DataFrame,
+    symbol: str = "BTCUSDT",
+    buy_threshold: float = 0.3,
+    sell_threshold: float = -0.3,
+) -> pd.Series:
+    """
+    Smart Beta Strategy based on Macro Analysis:
+    - Uses on-chain data (exchange inflows, whale accumulation, etc.)
+    - Buy: Macro Score > buy_threshold
+    - Sell: Macro Score < sell_threshold
+    - Risk Off: Automatically handled if Regime is EXTREME_VOLATILITY (returns -1)
+    """
+    # Note: In a real backtest, this should use historical macro data.
+    # For live/paper trading, we get the current macro score.
+    macro_info = await macro_analysis_service.get_macro_score(symbol)
+    score = macro_info.get("macro_score", 0.0)
+    regime = macro_info.get("regime", "SIDEWAYS")
+    
+    signals = pd.Series(0, index=df.index)
+    
+    # If in extreme volatility, force a sell/risk-off signal
+    if regime == "EXTREME_VOLATILITY":
+        signals.iloc[-1] = -1
+        return signals
+        
+    # Standard threshold-based signals
+    if score > buy_threshold:
+        signals.iloc[-1] = 1
+    elif score < sell_threshold:
+        signals.iloc[-1] = -1
+        
+    return signals
+
+
+async def _basis_trading_signal(
+    df: pd.DataFrame,
+    symbol: str = "BTCUSDT",
+    min_funding_rate: float = 0.0001, # 0.01%
+) -> pd.Series:
+    """
+    Basis Trading (Arbitrage) Strategy:
+    - Long Spot, Short Perpetual to collect funding fees.
+    - Simplified logic: buy if funding rate > min_funding_rate.
+    """
+    # In a real system, we'd fetch the actual funding rate from Binance.
+    # Here we simulate/fetch the current funding rate.
+    from app.services.binance_service import binance_service
+    
+    try:
+        # 模拟获取资金费率
+        # funding_info = await binance_service.get_funding_rate(symbol)
+        # funding_rate = float(funding_info.get("lastFundingRate", 0))
+        funding_rate = 0.0003 # 模拟为 0.03%
+    except Exception:
+        funding_rate = 0.0
+        
+    signals = pd.Series(0, index=df.index)
+    
+    if funding_rate > min_funding_rate:
+        # Buy Spot (Signal = 1) and Sell Future (handled by execution logic)
+        signals.iloc[-1] = 1
+    elif funding_rate < 0:
+        # Funding is negative, exit the basis trade
+        signals.iloc[-1] = -1
+        
     return signals
 
 
@@ -523,6 +593,63 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         ],
         "signal_func": _ichimoku_trend_signal,
     },
+    "smart_beta": {
+        "id": "smart_beta",
+        "name": "宏观价值配置策略 (Smart Beta)",
+        "description": "结合交易所流向、大户持仓等宏观/链上数据进行中长线配置。在牛市或资金流入时加仓，在极端波动或资金流出时减仓避险。",
+        "params": [
+            {
+                "key":         "symbol",
+                "label":       "交易对",
+                "type":        "str",
+                "default":     "BTCUSDT",
+                "description": "分析的目标币种。",
+            },
+            {
+                "key":         "buy_threshold",
+                "label":       "买入阈值",
+                "type":        "float",
+                "default":     0.3,
+                "min":         0.1,
+                "max":         0.9,
+                "step":        0.1,
+                "description": "宏观评分超过此值时买入。默认 0.3。",
+            },
+            {
+                "key":         "sell_threshold",
+                "label":       "卖出阈值",
+                "type":        "float",
+                "default":     -0.3,
+                "min":         -0.9,
+                "max":         -0.1,
+                "step":        0.1,
+                "description": "宏观评分低于此值时卖出。默认 -0.3。",
+            },
+        ],
+        "signal_func": _smart_beta_signal,
+    },
+    "basis": {
+        "id": "basis",
+        "name": "期现套利策略 (Basis Trading)",
+        "description": "利用现货与永续合约的资金费率差异获利。当费率为正时做多现货做空合约，赚取费率。低风险稳健策略。",
+        "params": [
+            {
+                "key":         "symbol",
+                "label":       "交易对",
+                "type":        "str",
+                "default":     "BTCUSDT",
+                "description": "进行套利的目标品种。",
+            },
+            {
+                "key":         "min_funding_rate",
+                "label":       "最低入场费率",
+                "type":        "float",
+                "default":     0.0001,
+                "description": "资金费率高于此值时才入场。默认 0.01%。",
+            },
+        ],
+        "signal_func": _basis_trading_signal,
+    },
 }
 
 
@@ -559,14 +686,20 @@ def build_signal_func(strategy_type: str, params: Dict[str, Any]) -> Callable:
         val = params.get(key, p["default"])
         if p["type"] == "int":
             val = int(val)
-        else:
+        elif p["type"] == "float":
             val = float(val)
+        # For 'str' type, keep as is
         validated[key] = val
 
-    def signal_func(df: pd.DataFrame) -> pd.Series:
-        return raw_func(df, **validated)
-
-    return signal_func
+    import inspect
+    if inspect.iscoroutinefunction(raw_func):
+        async def signal_func_async(df: pd.DataFrame) -> pd.Series:
+            return await raw_func(df, **validated)
+        return signal_func_async
+    else:
+        def signal_func_sync(df: pd.DataFrame) -> pd.Series:
+            return raw_func(df, **validated)
+        return signal_func_sync
 
 
 

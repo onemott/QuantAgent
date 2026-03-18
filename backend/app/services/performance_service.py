@@ -78,16 +78,17 @@ class PerformanceService:
         metrics["total_loss"] = round(total_loss, 2)
 
         if total_loss > 0:
-            metrics["profit_factor"] = round(total_profit / total_loss, 2)
+            metrics["profit_factor"] = round(float(total_profit / total_loss), 2)
         else:
-            metrics["profit_factor"] = float("inf") if total_profit > 0 else 0
+            # Avoid infinity for JSON compatibility
+            metrics["profit_factor"] = 99.99 if total_profit > 0 else 0.0
 
         metrics["avg_profit"] = round(
-            total_profit / len(winning), 2
-        ) if winning else 0
+            float(total_profit / len(winning)), 2
+        ) if winning else 0.0
         metrics["avg_loss"] = round(
-            total_loss / len(losing), 2
-        ) if losing else 0
+            float(total_loss / len(losing)), 2
+        ) if losing else 0.0
 
         # Max drawdown
         max_dd, max_dd_pct = self._calculate_max_drawdown(equity_curve)
@@ -100,7 +101,7 @@ class PerformanceService:
 
         # Volatility
         volatility = self._calculate_volatility(returns)
-        metrics["volatility"] = round(volatility * 100, 2)
+        metrics["volatility"] = round(float(volatility * 100), 2)
 
         # Annualized return
         days = max((end_date - start_date).days, 1)
@@ -110,40 +111,40 @@ class PerformanceService:
                 ((final_equity / init_cap) ** (1 / years)) - 1
             ) * 100
         else:
-            annualized = 0
-        metrics["annualized_return"] = round(annualized, 2)
+            annualized = 0.0
+        metrics["annualized_return"] = round(float(annualized), 2)
 
         # Sharpe ratio
         if volatility > 0:
             metrics["sharpe_ratio"] = round(
-                (annualized / 100 - self.RISK_FREE_RATE) / volatility, 2
+                float((annualized / 100 - self.RISK_FREE_RATE) / volatility), 2
             )
         else:
-            metrics["sharpe_ratio"] = 0
+            metrics["sharpe_ratio"] = 0.0
 
         # Sortino ratio (downside volatility)
         downside_returns = [r for r in returns if r < 0]
         if downside_returns:
-            downside_vol = float(np.std(downside_returns)) * np.sqrt(252)
+            downside_vol = float(np.std(downside_returns) * np.sqrt(252))
         else:
-            downside_vol = 0
+            downside_vol = 0.0
 
         if downside_vol > 0:
             metrics["sortino_ratio"] = round(
-                (annualized / 100 - self.RISK_FREE_RATE) / downside_vol, 2
+                float((annualized / 100 - self.RISK_FREE_RATE) / downside_vol), 2
             )
         else:
-            metrics["sortino_ratio"] = 0
+            metrics["sortino_ratio"] = 0.0
 
         # Calmar ratio
         if max_dd_pct > 0:
-            metrics["calmar_ratio"] = round(annualized / max_dd_pct, 2)
+            metrics["calmar_ratio"] = round(float(annualized / max_dd_pct), 2)
         else:
-            metrics["calmar_ratio"] = 0
+            metrics["calmar_ratio"] = 0.0
 
         # VaR (Value at Risk)
-        metrics["var_95"] = round(self.calculate_var(returns, 0.95), 2)
-        metrics["var_99"] = round(self.calculate_var(returns, 0.99), 2)
+        metrics["var_95"] = round(float(self.calculate_var(returns, 0.95)), 2)
+        metrics["var_99"] = round(float(self.calculate_var(returns, 0.99)), 2)
 
         # Holding time stats
         holding_hours = [
@@ -167,43 +168,53 @@ class PerformanceService:
     async def _get_closed_pairs_with_tca(self, start: datetime, end: datetime) -> List[Dict]:
         """Fetch closed trade pairs and their corresponding trades for TCA calculation."""
         async with get_db() as session:
-            # Join TradePair with PaperTrade (entry and exit)
-            from sqlalchemy.orm import aliased
-            EntryTrade = aliased(PaperTrade)
-            ExitTrade = aliased(PaperTrade)
-
+            from sqlalchemy import select
+            
+            closed_pairs = []
+            
             stmt = (
-                select(TradePair, EntryTrade, ExitTrade)
-                .join(EntryTrade, TradePair.entry_trade_id == EntryTrade.id)
-                .outerjoin(ExitTrade, TradePair.exit_trade_id == ExitTrade.id)
+                select(TradePair)
                 .where(TradePair.status == "CLOSED")
                 .where(TradePair.exit_time >= start)
                 .where(TradePair.exit_time <= end)
                 .order_by(TradePair.exit_time.asc())
             )
-
             result = await session.execute(stmt)
-            rows = result.all()
-
-            pairs = []
-            for pair, entry, exit in rows:
+            pairs_rows = result.scalars().all()
+            
+            if not pairs_rows:
+                return []
+            
+            for pair_row in pairs_rows:
+                entry_trade = None
+                exit_trade = None
+                
+                if pair_row.entry_trade_id:
+                    entry_stmt = select(PaperTrade).where(PaperTrade.id == pair_row.entry_trade_id)
+                    entry_result = await session.execute(entry_stmt)
+                    entry_trade = entry_result.scalar_one_or_none()
+                
+                if pair_row.exit_trade_id:
+                    exit_stmt = select(PaperTrade).where(PaperTrade.id == pair_row.exit_trade_id)
+                    exit_result = await session.execute(exit_stmt)
+                    exit_trade = exit_result.scalar_one_or_none()
+                
                 p_dict = {
-                    "pair_id": pair.pair_id,
-                    "symbol": pair.symbol,
-                    "side": pair.side,
-                    "pnl": float(pair.pnl) if pair.pnl else 0,
-                    "holding_hours": float(pair.holding_hours) if pair.holding_hours else 0,
-                    # Entry TCA
-                    "entry_price": float(entry.price),
-                    "entry_benchmark": float(entry.benchmark_price) if entry.benchmark_price else float(entry.price),
-                    "entry_side": entry.side,
-                    # Exit TCA
-                    "exit_price": float(exit.price) if exit else 0,
-                    "exit_benchmark": float(exit.benchmark_price) if exit and exit.benchmark_price else (float(exit.price) if exit else 0),
-                    "exit_side": exit.side if exit else None,
+                    "pair_id": pair_row.pair_id,
+                    "symbol": pair_row.symbol,
+                    "side": pair_row.side,
+                    "pnl": float(pair_row.pnl) if pair_row.pnl else 0,
+                    "holding_hours": float(pair_row.holding_hours) if pair_row.holding_hours else 0,
+                    "entry_price": float(entry_trade.price) if entry_trade else 0,
+                    "entry_benchmark": float(entry_trade.benchmark_price) if entry_trade and entry_trade.benchmark_price else (float(entry_trade.price) if entry_trade else 0),
+                    "entry_side": entry_trade.side if entry_trade else None,
+                    "exit_price": float(exit_trade.price) if exit_trade else 0,
+                    "exit_benchmark": float(exit_trade.benchmark_price) if exit_trade and exit_trade.benchmark_price else (float(exit_trade.price) if exit_trade else 0),
+                    "exit_side": exit_trade.side if exit_trade else None,
                 }
-                pairs.append(p_dict)
-            return pairs
+                closed_pairs.append(p_dict)
+            
+            return closed_pairs
 
     def _calculate_tca_metrics(self, pairs: List[Dict]) -> Dict:
         """Calculate Transaction Cost Analysis metrics."""
@@ -239,14 +250,14 @@ class PerformanceService:
                 exit_slippages.append(s)
                 total_cost += s * p["exit_benchmark"]
 
-        avg_entry = np.mean(entry_slippages) if entry_slippages else 0
-        avg_exit = np.mean(exit_slippages) if exit_slippages else 0
+        avg_entry = float(np.mean(entry_slippages)) if entry_slippages else 0.0
+        avg_exit = float(np.mean(exit_slippages)) if exit_slippages else 0.0
 
         # BPS (Basis Points)
         metrics = {
-            "avg_entry_slippage_bps": round(avg_entry * 10000, 2),
-            "avg_exit_slippage_bps": round(avg_exit * 10000, 2),
-            "total_slippage_cost": round(total_cost, 2),
+            "avg_entry_slippage_bps": round(float(avg_entry * 10000), 2),
+            "avg_exit_slippage_bps": round(float(avg_exit * 10000), 2),
+            "total_slippage_cost": round(float(total_cost), 2),
         }
 
         # Quality rating
@@ -329,7 +340,7 @@ class PerformanceService:
         """Calculate annualized volatility."""
         if not returns:
             return 0.0
-        return float(np.std(returns)) * np.sqrt(252)
+        return float(np.std(returns) * np.sqrt(252))
 
     def _max_consecutive(self, pairs: List[Dict], winning: bool) -> int:
         """Calculate max consecutive wins or losses."""
@@ -348,6 +359,34 @@ class PerformanceService:
                 current_streak = 0
 
         return max_streak
+
+    async def get_attribution(self, start_date: datetime, end_date: datetime) -> List[Dict]:
+        """Calculate profit attribution by strategy_id."""
+        async with get_db() as session:
+            stmt = (
+                select(
+                    TradePair.strategy_id,
+                    sqlfunc.sum(TradePair.pnl).label("total_pnl"),
+                    sqlfunc.count(TradePair.id).label("trade_count"),
+                    sqlfunc.avg(TradePair.pnl_pct).label("avg_pnl_pct")
+                )
+                .where(TradePair.status == "CLOSED")
+                .where(TradePair.exit_time >= start_date)
+                .where(TradePair.exit_time <= end_date)
+                .group_by(TradePair.strategy_id)
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+            
+            attribution = []
+            for row in rows:
+                attribution.append({
+                    "strategy_id": row.strategy_id or "manual",
+                    "total_pnl": float(row.total_pnl) if row.total_pnl else 0,
+                    "trade_count": row.trade_count,
+                    "avg_pnl_pct": float(row.avg_pnl_pct) if row.avg_pnl_pct else 0
+                })
+            return attribution
 
     def calculate_var(self, returns: List[float], confidence_level: float = 0.95) -> float:
         """

@@ -31,12 +31,12 @@ async def test_new_modules():
     print("\n=== Testing Strategy Templates ===")
     # Test Turtle Strategy
     turtle_func = build_signal_func("turtle", {"entry_period": 20, "exit_period": 10})
-    signals_turtle = turtle_func(df)
+    signals_turtle = await turtle_func(df)
     print(f"Turtle Signals (first 5): {signals_turtle.head().tolist()}")
     
     # Test Ichimoku Strategy
     ichi_func = build_signal_func("ichimoku", {"tenkan_period": 9, "kijun_period": 26})
-    signals_ichi = ichi_func(df)
+    signals_ichi = await ichi_func(df)
     print(f"Ichimoku Signals (first 5): {signals_ichi.head().tolist()}")
     
     print("\n=== Testing Anti-Black Swan Risk Logic ===")

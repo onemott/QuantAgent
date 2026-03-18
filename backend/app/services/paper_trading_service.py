@@ -6,7 +6,7 @@ Risk pre-checks are delegated to RiskManager before any BUY order is executed.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional, Dict, Any
 
@@ -37,6 +37,17 @@ class PaperTradingService:
     - Persists all trades/positions to PostgreSQL
     - Caches balance + positions in Redis (TTL 10s)
     """
+    def __init__(self):
+        self.simulated_time: Optional[datetime] = None
+
+    def set_simulated_time(self, timestamp: datetime):
+        """Set simulated time for historical replay mode"""
+        self.simulated_time = timestamp
+        logger.debug(f"PaperTradingService simulated time set to: {timestamp}")
+
+    def _get_current_time(self) -> datetime:
+        """Get current time (real or simulated)"""
+        return self.simulated_time or datetime.now(timezone.utc)
 
     # ─────────────────────────────────────────────────────────────
     # Account Balance
@@ -79,29 +90,32 @@ class PaperTradingService:
     async def _update_usdt_balance(self, session, new_balance: Decimal):
         result = await session.execute(select(PaperAccount).where(PaperAccount.id == 1))
         account = result.scalar_one_or_none()
+        now = self._get_current_time()
         if account is None:
-            account = PaperAccount(id=1, total_usdt=new_balance)
+            account = PaperAccount(id=1, total_usdt=new_balance, updated_at=now)
             session.add(account)
         else:
             account.total_usdt = new_balance
+            account.updated_at = now
         await redis_delete(REDIS_BALANCE_KEY)
 
     # ─────────────────────────────────────────────────────────────
     # Positions
     # ─────────────────────────────────────────────────────────────
-    async def get_positions(self, current_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+    async def get_positions(self, current_prices: Optional[Dict[str, float]] = None, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Return open positions with real-time PnL.
         current_prices: {symbol: price} dict for PnL calculation.
         """
-        cached = await redis_get(REDIS_POSITIONS_KEY)
-        if cached is not None and current_prices is None:
-            return cached
-
+        # If no session_id, fallback to "paper" mode (global positions)
         async with get_db() as session:
-            result = await session.execute(
-                select(PaperPosition).where(PaperPosition.quantity != 0)
-            )
+            stmt = select(PaperPosition).where(PaperPosition.quantity != 0)
+            if session_id:
+                stmt = stmt.where(PaperPosition.session_id == session_id)
+            else:
+                stmt = stmt.where(PaperPosition.session_id.is_(None))
+            
+            result = await session.execute(stmt)
             rows = result.scalars().all()
 
         positions = []
@@ -123,6 +137,8 @@ class PaperTradingService:
                 "side": "LONG" if qty > 0 else "SHORT",
                 "quantity": qty,
                 "avg_price": avg,
+                "leverage": row.leverage,
+                "liquidation_price": float(row.liquidation_price) if row.liquidation_price else None,
                 "mark_price": mark_price,
                 "pnl": round(pnl, 4),
                 "pnl_pct": round(pnl_pct, 4),
@@ -133,10 +149,14 @@ class PaperTradingService:
             await redis_set(REDIS_POSITIONS_KEY, positions, ttl=10)
         return positions
 
-    async def _get_position(self, session, symbol: str) -> Optional[PaperPosition]:
-        result = await session.execute(
-            select(PaperPosition).where(PaperPosition.symbol == symbol)
-        )
+    async def _get_position(self, session, symbol: str, session_id: Optional[str] = None) -> Optional[PaperPosition]:
+        stmt = select(PaperPosition).where(PaperPosition.symbol == symbol)
+        if session_id:
+            stmt = stmt.where(PaperPosition.session_id == session_id)
+        else:
+            stmt = stmt.where(PaperPosition.session_id.is_(None))
+        
+        result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
     # ─────────────────────────────────────────────────────────────
@@ -151,6 +171,10 @@ class PaperTradingService:
         order_type: str = "MARKET",
         benchmark_price: Optional[float] = None, # For TCA (Implementation Shortfall)
         client_order_id: Optional[str] = None,  # For idempotency
+        leverage: int = 1, # Added leverage parameter
+        strategy_id: Optional[str] = None, # Added for attribution
+        mode: str = "paper", # paper | backtest | historical_replay
+        session_id: Optional[str] = None, # For historical_replay session_id
     ) -> Dict[str, Any]:
         """
         Execute a simulated market order or place a limit order.
@@ -164,6 +188,9 @@ class PaperTradingService:
             raise ValueError("Quantity must be positive")
         if price <= 0:
             raise ValueError("Price must be positive")
+        
+        # Get current time for all records
+        now = self._get_current_time()
         
         # Idempotency check: if client_order_id provided, check for existing trade
         if client_order_id:
@@ -186,7 +213,7 @@ class PaperTradingService:
                         "fee": float(existing_trade.fee),
                         "pnl": float(existing_trade.pnl) if existing_trade.pnl else None,
                         "status": existing_trade.status,
-                        "created_at": existing_trade.created_at.isoformat() if existing_trade.created_at else None,
+                        "created_at": existing_trade.created_at.isoformat() if existing_trade.created_at else now.isoformat(),
                         "duplicate": True,
                     }
         
@@ -212,6 +239,7 @@ class PaperTradingService:
             current_positions=current_positions,
             total_portfolio_value=total_portfolio,
             market_price=price,
+            leverage=leverage,
         )
         if not risk_result.allowed:
             raise ValueError(f"[风控拦截] {risk_result.reason}")
@@ -226,6 +254,7 @@ class PaperTradingService:
             async with get_db() as session:
                 trade = PaperTrade(
                     client_order_id=client_order_id,
+                    strategy_id=strategy_id,
                     symbol=symbol,
                     side=side,
                     order_type="LIMIT",
@@ -235,6 +264,9 @@ class PaperTradingService:
                     fee=fee,
                     pnl=None,
                     status="NEW",  # Initial state for Limit Order
+                    mode=mode,
+                    session_id=session_id,
+                    created_at=now,
                 )
                 session.add(trade)
                 await session.commit()
@@ -251,7 +283,7 @@ class PaperTradingService:
                     "fee": float(fee),
                     "pnl": None,
                     "status": "NEW",
-                    "created_at": trade.created_at.isoformat(),
+                    "created_at": now.isoformat(),
                 }
 
         # MARKET execution (immediate fill)
@@ -269,13 +301,14 @@ class PaperTradingService:
             price_dec = price_dec * slippage_mult
             
             realized_pnl, new_qty, new_avg = await self._apply_fill_to_account(
-                session, symbol, side, qty_dec, price_dec, fee
+                session, symbol, side, qty_dec, price_dec, fee, leverage, strategy_id, session_id
             )
             
             pnl_record = realized_pnl if realized_pnl != 0 else None
 
             trade = PaperTrade(
                 client_order_id=client_order_id,
+                strategy_id=strategy_id,
                 symbol=symbol,
                 side=side,
                 order_type=order_type,
@@ -285,6 +318,9 @@ class PaperTradingService:
                 fee=fee,
                 pnl=pnl_record,
                 status="FILLED",
+                mode=mode,
+                session_id=session_id,
+                created_at=now,
             )
             session.add(trade)
             
@@ -302,7 +338,8 @@ class PaperTradingService:
                     "pnl": float(pnl_record) if pnl_record is not None else None,
                     "new_pos": float(new_qty)
                 },
-                ip_address="internal"
+                ip_address="internal",
+                created_at=now
             )
             session.add(audit)
             
@@ -318,14 +355,15 @@ class PaperTradingService:
         try:
             from app.services.trade_pair_service import trade_pair_service
             await trade_pair_service.on_trade_filled(
-                trade_id=trade_id,
-                symbol=symbol,
-                side=side,
-                quantity=qty_dec,
-                price=price_dec,
-                fee=fee,
-                created_at=created_at or datetime.utcnow(),
-            )
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty_dec,
+                    price=price_dec,
+                    fee=fee,
+                    created_at=created_at or now,
+                    strategy_id=strategy_id,
+                )
         except Exception as e:
             logger.error(f"Trade pairing failed: {e}")
 
@@ -350,7 +388,7 @@ class PaperTradingService:
             "fee": float(fee),
             "pnl": float(pnl_record) if pnl_record is not None else None,
             "status": "FILLED",
-            "created_at": created_at.isoformat() if created_at else datetime.utcnow().isoformat(),
+            "created_at": created_at.isoformat() if created_at else now.isoformat(),
         }
 
     async def cancel_order(self, order_id_str: str) -> Dict[str, Any]:
@@ -387,15 +425,16 @@ class PaperTradingService:
         return {"message": f"Order {order_id_str} canceled", "status": "CANCELED"}
 
     async def _apply_fill_to_account(
-        self, session, symbol: str, side: str, qty_dec: Decimal, price_dec: Decimal, fee: Decimal
+        self, session, symbol: str, side: str, qty_dec: Decimal, price_dec: Decimal, fee: Decimal, leverage: int = 1, strategy_id: Optional[str] = None, session_id: Optional[str] = None
     ):
         """Internal method to update position and balance on trade fill."""
         usdt_balance = await self._get_usdt_balance(session)
-        position = await self._get_position(session, symbol)
+        position = await self._get_position(session, symbol, session_id)
         
         # Current Position State
         curr_qty = position.quantity if position else Decimal(0)
         curr_avg = position.avg_price if position else Decimal(0)
+        curr_lev = position.leverage if position else 1
         
         # Determine Delta
         delta_qty = qty_dec if side == "BUY" else -qty_dec
@@ -409,28 +448,61 @@ class PaperTradingService:
                 # Opening / Adding
                 total_val = (curr_qty * curr_avg) + (delta_qty * price_dec)
                 new_avg = total_val / new_qty
+                # Use the new leverage for the whole position if it's different
+                new_lev = leverage 
             else:
                 # Closing / Reducing
                 new_avg = curr_avg
+                new_lev = curr_lev
                 realized_pnl = (price_dec - curr_avg) * (-delta_qty)
         else:
             # Flip Position
             realized_pnl = (price_dec - curr_avg) * curr_qty
             new_avg = price_dec
+            new_lev = leverage
+
+        # Calculate new liquidation price
+        liq_price = None
+        if new_qty != 0:
+            liq_price_val = risk_manager.calculate_liquidation_price(
+                side="BUY" if new_qty > 0 else "SELL",
+                entry_price=float(new_avg),
+                leverage=new_lev
+            )
+            liq_price = Decimal(str(liq_price_val))
 
         # Update Database (Position)
+        now = self._get_current_time()
         if new_qty == 0:
             if position:
                 await session.delete(position)
         else:
             if position is None:
-                position = PaperPosition(symbol=symbol, quantity=new_qty, avg_price=new_avg)
+                position = PaperPosition(
+                    symbol=symbol, 
+                    session_id=session_id,
+                    strategy_id=strategy_id,
+                    quantity=new_qty, 
+                    avg_price=new_avg, 
+                    leverage=new_lev,
+                    liquidation_price=liq_price,
+                    updated_at=now
+                )
                 session.add(position)
             else:
                 position.quantity = new_qty
                 position.avg_price = new_avg
+                position.leverage = new_lev
+                position.liquidation_price = liq_price
+                position.updated_at = now
+                if strategy_id:
+                    position.strategy_id = strategy_id
+                if session_id:
+                    position.session_id = session_id
         
         # Update Balance
+        # Margin is handled implicitly in paper trading by checking balance in check_order
+        # Here we just update the cash balance
         cash_change = - (delta_qty * price_dec) - fee
         new_balance = usdt_balance + cash_change
         await self._update_usdt_balance(session, new_balance)
@@ -442,6 +514,7 @@ class PaperTradingService:
         Check pending LIMIT orders (NEW/PARTIALLY_FILLED/PENDING) and execute.
         Should be called periodically by scheduler.
         """
+        now = self._get_current_time()
         async with get_db() as session:
             # Support multiple active states
             stmt = select(PaperTrade).where(PaperTrade.status.in_(["NEW", "PARTIALLY_FILLED", "PENDING"]))
@@ -474,7 +547,7 @@ class PaperTradingService:
                     fee = order.fee
                     
                     realized_pnl, new_qty, new_avg = await self._apply_fill_to_account(
-                        session, order.symbol, order.side, qty_dec, price_dec, fee
+                        session, order.symbol, order.side, qty_dec, price_dec, fee, strategy_id=order.strategy_id
                     )
                     
                     pnl_record = realized_pnl if realized_pnl != 0 else None
@@ -493,7 +566,8 @@ class PaperTradingService:
                             "qty": float(qty_dec),
                             "fill_price": float(price_dec),
                             "pnl": float(pnl_record) if pnl_record is not None else None
-                        }
+                        },
+                        created_at=now
                     )
                     session.add(audit)
                     matched_any = True
@@ -508,7 +582,8 @@ class PaperTradingService:
                             quantity=qty_dec,
                             price=price_dec,
                             fee=fee,
-                            created_at=order.created_at or datetime.utcnow(),
+                            created_at=order.created_at or now,
+                            strategy_id=order.strategy_id,
                         )
                     except Exception as e:
                         logger.error(f"Trade pairing failed for limit order {order.id}: {e}")
@@ -584,6 +659,64 @@ class PaperTradingService:
                 logger.error(f"Failed to close position {symbol}: {e}")
                 results.append({"symbol": symbol, "error": str(e)})
         return results
+
+    async def check_liquidations(self) -> List[Dict[str, Any]]:
+        """
+        后台清算检查任务：检查所有持仓是否触及清算价。
+        由定时任务调用。
+        """
+        async with get_db() as session:
+            result = await session.execute(
+                select(PaperPosition).where(PaperPosition.quantity != 0)
+            )
+            positions = result.scalars().all()
+            
+            if not positions:
+                return []
+                
+            liquidation_results = []
+            for pos in positions:
+                symbol = pos.symbol
+                qty = float(pos.quantity)
+                liq_price = float(pos.liquidation_price) if pos.liquidation_price else None
+                
+                if not liq_price:
+                    continue
+                    
+                try:
+                    current_price = await binance_service.get_price(symbol)
+                except Exception:
+                    continue
+                    
+                triggered = False
+                if qty > 0 and current_price <= liq_price: # 多头清算
+                    triggered = True
+                elif qty < 0 and current_price >= liq_price: # 空头清算
+                    triggered = True
+                    
+                if triggered:
+                    logger.warning(f"LIQUIDATION TRIGGERED: {symbol} at {current_price} (Liq: {liq_price})")
+                    # 执行清算平仓
+                    side = "SELL" if qty > 0 else "BUY"
+                    try:
+                        order_res = await self.create_order(
+                            symbol=symbol,
+                            side=side,
+                            quantity=abs(qty),
+                            price=current_price,
+                            order_type="MARKET"
+                        )
+                        # 记录清算事件
+                        await risk_manager._log_risk_event(symbol, "FORCE_LIQUIDATION", True, {
+                            "price": current_price,
+                            "liq_price": liq_price,
+                            "qty": qty
+                        })
+                        liquidation_results.append(order_res)
+                    except Exception as e:
+                        logger.error(f"Liquidation execution failed for {symbol}: {e}")
+                        
+            return liquidation_results
 
 
 # Singleton instance

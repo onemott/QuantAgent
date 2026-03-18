@@ -12,15 +12,17 @@ Risk Manager — 风控规则引擎
 """
 
 import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 from sqlalchemy import select, func as sqlfunc
 
 from app.services.database import get_db, redis_get, redis_set
 from app.core.config import settings
 from app.models.db_models import RiskEvent, PaperTrade, PaperAccount
+from app.services.macro_analysis_service import macro_analysis_service
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,17 @@ class RiskManager:
     单例风控引擎。
     所有风控方法均为 async，调用时需 await。
     """
+    def __init__(self):
+        self.simulated_time: Optional[datetime] = None
+
+    def set_simulated_time(self, timestamp: datetime):
+        """Set simulated time for historical replay mode"""
+        self.simulated_time = timestamp
+        logger.debug(f"RiskManager simulated time set to: {timestamp}")
+
+    def _get_current_time(self) -> datetime:
+        """Get current time (real or simulated)"""
+        return self.simulated_time or datetime.now(timezone.utc)
 
     # ── 阈值获取 (支持热更新) ──────────────────────────────────────────────────
     async def get_config(self) -> Dict[str, float]:
@@ -72,6 +85,10 @@ class RiskManager:
             "MAX_DAILY_LOSS_PCT": settings.MAX_DAILY_LOSS_PCT,
             "PRICE_DEVIATION_PCT": settings.PRICE_DEVIATION_PCT,
             "MAX_VOLATILITY_THRESHOLD": 0.80, # 80% 年化波动率阈值
+            "MAINTENANCE_MARGIN_RATE": settings.MAINTENANCE_MARGIN_RATE,
+            "MARGIN_WARNING_LEVEL": settings.MARGIN_WARNING_LEVEL,
+            "PRE_LIQUIDATION_LEVEL": settings.PRE_LIQUIDATION_LEVEL,
+            "VOLATILITY_TARGET_PCT": settings.VOLATILITY_TARGET_PCT,
         }
 
     async def update_config(self, new_config: Dict[str, float]):
@@ -79,6 +96,56 @@ class RiskManager:
         import json
         await redis_set(REDIS_RISK_CONFIG_KEY, json.dumps(new_config))
         logger.info(f"Risk config updated: {new_config}")
+
+    # ── 保证金管理 (Margin Management) ──────────────────────────────────────────
+    def calculate_margin_usage(self, positions: List[Dict[str, Any]], total_portfolio_value: float) -> float:
+        """
+        计算当前账户的保证金使用率。
+        已用保证金 = Σ (持仓市值 / 杠杆)
+        使用率 = 已用保证金 / 账户权益 (Equity)
+        """
+        if total_portfolio_value <= 0:
+            return 1.0
+            
+        used_margin = Decimal("0")
+        for pos in positions:
+            qty = Decimal(str(pos["quantity"]))
+            avg = Decimal(str(pos["avg_price"]))
+            lev = pos.get("leverage", 1)
+            used_margin += (abs(qty) * avg) / Decimal(str(lev))
+            
+        return float(used_margin) / total_portfolio_value
+
+    def calculate_liquidation_price(self, side: str, entry_price: float, leverage: int, maintenance_margin_rate: float = 0.05) -> float:
+        """
+        计算清算价格 (Liquidation Price)。
+        做多: LiqPrice = EntryPrice * (1 - (1/Leverage) + MaintenanceMarginRate)
+        做空: LiqPrice = EntryPrice * (1 + (1/Leverage) - MaintenanceMarginRate)
+        """
+        side = side.upper()
+        if side == "BUY" or side == "LONG":
+            return entry_price * (1 - (1/leverage) + maintenance_margin_rate)
+        else:
+            return entry_price * (1 + (1/leverage) - maintenance_margin_rate)
+
+    async def get_volatility_adjusted_size(self, symbol: str, base_capital: float, daily_volatility: Optional[float] = None) -> float:
+        """
+        基于波动率的仓位管理 (Volatility Targeting)。
+        公式：仓位大小 = (目标波动率 / 资产波动率) * 基础资金
+        """
+        config = await self.get_config()
+        target_vol = config.get("VOLATILITY_TARGET_PCT", 0.02) # 默认 2% 日波动率目标
+        
+        if daily_volatility is None or daily_volatility == 0:
+            # 默认使用最近 24h 波动率 (此处模拟)
+            daily_volatility = 0.03 # 假设 3%
+            
+        # 杠杆因子 = 目标 / 实际
+        leverage_factor = target_vol / daily_volatility
+        # 限制杠杆因子上限，避免过度放大
+        leverage_factor = min(leverage_factor, 5.0)
+        
+        return base_capital * leverage_factor
 
     # ── 主入口：下单前检查 ────────────────────────────────────────────────────
     async def check_order(
@@ -104,6 +171,19 @@ class RiskManager:
         # 获取当前配置
         config = await self.get_config()
         
+        # 判定是否为开仓/加仓行为 (增加敞口)
+        current_pos_qty = Decimal(str(current_positions.get(symbol, 0)))
+        is_opening = False
+        if side == "BUY" and current_pos_qty >= 0: # 加多
+            is_opening = True
+            new_qty = current_pos_qty + quantity_dec
+        elif side == "SELL" and current_pos_qty <= 0: # 加空
+            is_opening = True
+            new_qty = current_pos_qty - quantity_dec
+        else:
+            # 减仓或平仓，通常允许
+            pass
+
         # ── 规则 0：全局熔断 (Kill Switch) ────────────────────────────────────
         kill_switch = await redis_get(REDIS_KILL_SWITCH_KEY)
         if kill_switch:
@@ -111,13 +191,21 @@ class RiskManager:
 
         # ── 规则 0.1：波动率激增拦截 (Anti-Black Swan) ────────────────────────
         if is_opening:
-            # 获取当前资产的波动率（模拟，实际应由 MarketAnalysis 提供）
-            # 这里我们简单模拟：若当前价格相对于 24h 移动平均偏离超过 15%，视为异常波动
             volatility_spike = await self._check_tail_risk(symbol, market_price)
             if volatility_spike:
-                reason = f"波动率激增 (Tail Risk)：检测到 {symbol} 处于极端波动期，强制进入避险模式（转换为稳定币/禁止开仓）"
+                reason = f"波动率激增 (Tail Risk)：检测到 {symbol} 处于极端波动期，强制进入避险模式（禁止新开仓并建议清仓）"
                 await self._log_risk_event(symbol, "TAIL_RISK_HALT", True, {"symbol": symbol, "market_price": market_price})
+                # 自动触发避险平仓
+                asyncio.create_task(self.handle_tail_risk())
                 return RiskCheckResult(allowed=False, rule="TAIL_RISK_HALT", reason=reason)
+
+        # ── 规则 0.2：宏观风险检查 (Macro Risk / Smart Beta) ──────────────────
+        if is_opening:
+            macro_risk = await self._check_macro_risk(symbol)
+            if macro_risk:
+                reason = f"宏观风险预警 (Macro Risk)：当前宏观环境极差或处于极端波动周期，禁止新开中长线仓位。"
+                await self._log_risk_event(symbol, "MACRO_RISK_HALT", True, {"symbol": symbol})
+                return RiskCheckResult(allowed=False, rule="MACRO_RISK_HALT", reason=reason)
 
         # ── 规则 0.5：异常交易拦截 (Fat Finger) ──────────────────────────────
         if market_price and market_price > 0:
@@ -135,13 +223,9 @@ class RiskManager:
                 })
                 return RiskCheckResult(allowed=False, rule="FAT_FINGER", reason=reason)
             
-            # 大单拆分检查
-            # 假设 ADV (Average Daily Volume) 为 100M (模拟值)
-            # 实际应从数据库或 MarketAnalysis 获取
+            # 大单拆分检查 (ADV 模拟)
             ADV = 100_000_000 
             if float(order_value) > ADV * 0.01:
-                 # 警告但不一定拒绝，或者要求拆单
-                 # 这里我们简单记录日志并拒绝
                  reason = f"订单价值 ${float(order_value):.2f} 超过日均成交量 1% (大单拦截)"
                  return RiskCheckResult(allowed=False, rule="LARGE_ORDER", reason=reason)
 
@@ -150,22 +234,7 @@ class RiskManager:
         if leverage > max_leverage:
              return RiskCheckResult(allowed=False, rule="MAX_LEVERAGE", reason=f"Leverage {leverage}x exceeds dynamic limit {max_leverage}x (Portfolio: ${total_portfolio_value:,.0f})")
 
-        # ── 规则 1：单仓上限 (针对开仓) ───────────────────────────────────────
-        # 无论是做多 (BUY) 还是 做空 (SELL when pos <= 0)，只要是增加风险敞口
-        current_pos_qty = Decimal(str(current_positions.get(symbol, 0)))
-        
-        is_opening = False
-        if side == "BUY" and current_pos_qty >= 0: # 加多
-            is_opening = True
-            new_qty = current_pos_qty + quantity_dec
-        elif side == "SELL" and current_pos_qty <= 0: # 加空
-            is_opening = True
-            new_qty = current_pos_qty - quantity_dec
-        else:
-            # 减仓或平仓，通常允许，除非是为了反手
-            # 简化：如果是减仓，不检查单仓上限
-            pass
-
+        # ── 规则 1：单仓上限 ──────────────────────────────────────────────────
         if is_opening:
             new_pos_value = abs(new_qty) * price_dec
             single_pos_limit = config.get("MAX_SINGLE_POSITION_PCT", 0.20)
@@ -183,8 +252,34 @@ class RiskManager:
                 })
                 return RiskCheckResult(allowed=False, rule="MAX_SINGLE_POSITION", reason=reason)
 
+        # ── 规则 1.1：保证金使用率预警/拦截 ────────────────────────────────────
+        if is_opening:
+            # 模拟新持仓后的保证金使用率
+            # 先构建模拟持仓列表
+            mock_positions = []
+            for s, q in current_positions.items():
+                if s == symbol:
+                    mock_positions.append({"symbol": s, "quantity": float(new_qty), "avg_price": price, "leverage": leverage})
+                else:
+                    # 获取该币种的历史平均价和杠杆（这里模拟为 1）
+                    mock_positions.append({"symbol": s, "quantity": q, "avg_price": price, "leverage": 1})
+            
+            if symbol not in current_positions:
+                mock_positions.append({"symbol": symbol, "quantity": float(new_qty), "avg_price": price, "leverage": leverage})
+                
+            margin_usage = self.calculate_margin_usage(mock_positions, total_portfolio_value)
+            warning_level = config.get("MARGIN_WARNING_LEVEL", 0.70)
+            pre_liq_level = config.get("PRE_LIQUIDATION_LEVEL", 0.90)
+            
+            if margin_usage >= pre_liq_level:
+                reason = f"保证金使用率过高：当前模拟使用率 {margin_usage*100:.2f}%，超过强制拦截阈值 {pre_liq_level*100:.0f}%"
+                await self._log_risk_event(symbol, "MARGIN_USAGE_HALT", True, {"usage": margin_usage})
+                return RiskCheckResult(allowed=False, rule="MARGIN_USAGE_HALT", reason=reason)
+            elif margin_usage >= warning_level:
+                logger.warning(f"MARGIN WARNING: Account margin usage at {margin_usage*100:.2f}% (Limit: {warning_level*100:.0f}%)")
+                await self._log_risk_event(symbol, "MARGIN_USAGE_WARNING", True, {"usage": margin_usage})
+
         # ── 规则 2：总回撤熔断 ────────────────────────────────────────────────
-        # 若触发熔断，仅允许平仓 (Close positions)，禁止开仓
         if is_opening:
             peak = await self._get_peak_balance(total_portfolio_value)
             if peak > 0:
@@ -220,9 +315,6 @@ class RiskManager:
                     return RiskCheckResult(allowed=False, rule="DAILY_LOSS_HALT", reason=reason)
 
         # ── 规则 4：余额/保证金充足性 ────────────────────────────────────────
-        # 这里的 balance 是可用余额。
-        # 开仓成本 = (Order Value / Leverage) + Fee
-        # Fee 通常按全额计算
         if is_opening:
             margin_required = order_value / Decimal(leverage)
             fee = order_value * FEE_RATE
@@ -237,16 +329,13 @@ class RiskManager:
         
         # ── 做空风控 (Locate) ────────────────────────────────────────────────
         if side == "SELL" and is_opening:
-             # 模拟借币检查
              if symbol in HARD_TO_BORROW_SYMBOLS:
-                 # 50% chance to fail locate for HTB symbols
                  import random
                  if random.random() < 0.5:
                      reason = f"融券失败 (Locate Failed): {symbol} 属于难借资产，当前无券源"
                      await self._log_risk_event(symbol, "LOCATE_FAILED", True, {"symbol": symbol})
                      return RiskCheckResult(allowed=False, rule="LOCATE_FAILED", reason=reason)
 
-        # 所有规则通过
         return RiskCheckResult(allowed=True)
 
     def _calculate_dynamic_leverage(self, portfolio_value: float) -> int:
@@ -312,6 +401,11 @@ class RiskManager:
     # ── 更新峰值余额（每次成功交易后调用）────────────────────────────────────
     async def update_peak_balance(self, current_total_value: float) -> None:
         """若当前总资产超过历史峰值，更新峰值记录。"""
+        if self.simulated_time:
+            if not hasattr(self, 'replay_peak_balance') or current_total_value > self.replay_peak_balance:
+                self.replay_peak_balance = current_total_value
+            return
+
         peak = await redis_get(REDIS_PEAK_BALANCE_KEY)
         peak_val = float(peak) if peak is not None else float(INITIAL_BALANCE)
         if current_total_value > peak_val:
@@ -369,6 +463,66 @@ class RiskManager:
             for row in rows
         ]
 
+    async def handle_tail_risk(self):
+        """
+        处理尾部风险：强制平仓所有头寸并转换为稳定币。
+        """
+        logger.warning("TAIL RISK DETECTED: Initiating emergency position closure.")
+        
+        # 实际实现中应调用 PaperTradingService.close_all_positions
+        # 由于循环引用问题，通常我们会通过事件总线或回调来实现
+        # 这里演示逻辑：
+        try:
+            from app.services.paper_trading_service import paper_trading_service
+            from app.services.binance_service import binance_service
+            
+            positions = await paper_trading_service.get_positions()
+            if not positions:
+                return
+            
+            symbols = [p["symbol"] for p in positions]
+            current_prices = {}
+            for s in symbols:
+                current_prices[s] = await binance_service.get_price(s)
+            
+            await paper_trading_service.close_all_positions(current_prices)
+            await self._log_risk_event("ALL", "TAIL_RISK_HEDGE", True, {"action": "CLOSE_ALL_POSITIONS"})
+        except Exception as e:
+            logger.error(f"Failed to handle tail risk: {e}")
+
+    async def check_and_handle_pre_liquidation(self, total_portfolio_value: float):
+        """
+        检查并处理预平仓逻辑 (Pre-liquidation Trigger)。
+        当保证金使用率过高时，自动平掉部分头寸。
+        """
+        from app.services.paper_trading_service import paper_trading_service
+        from app.services.binance_service import binance_service
+        
+        config = await self.get_config()
+        pre_liq_level = config.get("PRE_LIQUIDATION_LEVEL", 0.90)
+        
+        positions = await paper_trading_service.get_positions()
+        if not positions:
+            return
+            
+        margin_usage = self.calculate_margin_usage(positions, total_portfolio_value)
+        
+        if margin_usage >= pre_liq_level:
+            logger.warning(f"PRE-LIQUIDATION TRIGGERED: Margin usage at {margin_usage*100:.2f}%. Reducing exposure.")
+            
+            # 自动减仓：平掉 50% 的杠杆头寸
+            # 这里简单起见，平掉所有头寸
+            symbols = [p["symbol"] for p in positions]
+            current_prices = {}
+            for s in symbols:
+                current_prices[s] = await binance_service.get_price(s)
+                
+            await paper_trading_service.close_all_positions(current_prices)
+            await self._log_risk_event("ALL", "PRE_LIQUIDATION_HALT", True, {
+                "margin_usage": margin_usage,
+                "action": "CLOSE_ALL_POSITIONS"
+            })
+
     # ── 内部辅助方法 ──────────────────────────────────────────────────────────
     async def _check_tail_risk(self, symbol: str, current_price: Optional[float]) -> bool:
         """
@@ -378,20 +532,47 @@ class RiskManager:
         if not current_price:
             return False
             
-        # 实际实现应从数据库或行情接口获取最近 24h K 线。
-        # 这里演示逻辑：假设 24h 波动阈值为 10%
-        # 获取此 symbol 之前的记录（若存在）来计算。
-        # 暂时用随机模拟触发，或根据 current_price 与 INITIAL_PRICE 对比
-        # 在实际工程中，此函数应由 MarketAnalysisService 提供。
-        
-        # 演示逻辑：
-        # 如果当前波动超过配置阈值（模拟：价格波动率 > 10%）
+        # 实际实现应从行情接口获取最近 24h K 线并计算波动率
+        # 这里演示逻辑：
+        # 1. 获取市场周期 (Regime)
+        macro_info = await macro_analysis_service.get_macro_score(symbol)
+        if macro_info.get("regime") == "EXTREME_VOLATILITY":
+            return True # 极端波动期
+            
+        # 2. 模拟波动率检查 (实际应基于 ATR 或 Standard Deviation)
         import random
-        # 模拟 5% 的概率发生“黑天鹅”波动，或根据价格变动幅度。
-        return random.random() < 0.02 # 2% 的概率模拟黑天鹅或高波动拦截
+        # 模拟 1% 的随机黑天鹅触发
+        return random.random() < 0.01
+
+    async def _check_macro_risk(self, symbol: str) -> bool:
+        """
+        检查宏观风险：如果宏观评分过低，禁止新开仓位。
+        """
+        try:
+            macro_info = await macro_analysis_service.get_macro_score(symbol)
+            score = macro_info.get("macro_score", 0)
+            regime = macro_info.get("regime", "SIDEWAYS")
+            
+            # 如果宏观评分极低 (<-0.8) 或 处于极端波动期，视为高风险
+            if score < -0.8 or regime == "EXTREME_VOLATILITY":
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to check macro risk: {e}")
+            
+        return False
         
     async def _get_peak_balance(self, current_value: float) -> float:
         """从 Redis 获取历史峰值余额，若无记录则使用初始余额。"""
+        # If in replay mode, we use a transient peak balance to avoid polluting live data
+        if self.simulated_time:
+            # For simplicity, we can use the initial balance as peak or 
+            # ideally track it in the session. For now, let's just use initial_balance
+            # to avoid complex session-based peak tracking in this singleton.
+            # Alternatively, we could store it in self.replay_peak_balance
+            if not hasattr(self, 'replay_peak_balance') or current_value > self.replay_peak_balance:
+                self.replay_peak_balance = current_value
+            return self.replay_peak_balance
+
         peak = await redis_get(REDIS_PEAK_BALANCE_KEY)
         if peak is None:
             await redis_set(REDIS_PEAK_BALANCE_KEY, float(INITIAL_BALANCE), ttl=86400 * 365)
@@ -405,16 +586,33 @@ class RiskManager:
 
     async def _get_today_realized_pnl(self) -> float:
         """计算今日已实现盈亏（仅平仓交易含 pnl）。"""
-        today_key = REDIS_DAILY_LOSS_KEY.format(
-            date=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        )
+        current_time = self._get_current_time()
+        today_str = current_time.strftime("%Y-%m-%d")
+        
+        # If in replay mode, we don't use Redis for PNL to avoid conflicts
+        if self.simulated_time:
+            today_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+            try:
+                async with get_db() as session:
+                    stmt = (
+                        select(sqlfunc.coalesce(sqlfunc.sum(PaperTrade.pnl), 0))
+                        .where(PaperTrade.pnl.isnot(None))
+                        .where(PaperTrade.created_at >= today_start)
+                        .where(PaperTrade.created_at <= current_time)
+                        .where(PaperTrade.mode == "historical_replay") # Only for replay
+                    )
+                    result = await session.execute(stmt)
+                    return float(result.scalar() or 0)
+            except Exception as e:
+                logger.warning(f"Failed to query replay PnL: {e}")
+                return 0.0
+
+        today_key = REDIS_DAILY_LOSS_KEY.format(date=today_str)
         cached = await redis_get(today_key)
         if cached is not None:
             return float(cached)
 
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        today_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
         try:
             async with get_db() as session:
                 # 统计所有已平仓的 PnL (pnl is not null)
@@ -422,6 +620,7 @@ class RiskManager:
                     select(sqlfunc.coalesce(sqlfunc.sum(PaperTrade.pnl), 0))
                     .where(PaperTrade.pnl.isnot(None))
                     .where(PaperTrade.created_at >= today_start)
+                    .where(PaperTrade.mode == "paper") # Only for live paper
                 )
                 result = await session.execute(stmt)
                 total_pnl = float(result.scalar() or 0)
@@ -447,6 +646,7 @@ class RiskManager:
                     rule=rule,
                     triggered=triggered,
                     detail=detail,
+                    created_at=self._get_current_time()
                 )
                 session.add(event)
         except Exception as e:

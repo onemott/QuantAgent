@@ -3,10 +3,10 @@ import websockets
 import json
 
 async def test_ws():
-    uri = "ws://localhost:8000/ws/market"
-    print(f"Connecting to {uri} inside container...")
+    uri = "ws://127.0.0.1:8002/ws/market"
+    print(f"Connecting to {uri}...")
     try:
-        async with websockets.connect(uri) as websocket:
+        async with websockets.connect(uri, open_timeout=20.0) as websocket:
             print("Connected successfully!")
             
             # Send subscribe message

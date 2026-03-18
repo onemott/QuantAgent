@@ -8,6 +8,7 @@ from typing import Optional
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from app.services.attribution_service import attribution_service
 from app.services.performance_service import performance_service
 from app.services.trade_pair_service import trade_pair_service
 from app.services.position_analysis_service import position_analysis_service
@@ -31,7 +32,7 @@ CACHE_TTL = 30  # 30 seconds cache
 
 @router.get("/performance")
 async def get_performance_metrics(
-    period: str = Query("all_time", pattern="^(daily|weekly|monthly|all_time)$")
+    period: str = Query("all_time", pattern="^(daily|today|weekly|monthly|all_time)$")
 ):
     """Get aggregated performance metrics for a given period."""
     cache_key = REDIS_PERF_KEY.format(period=period)
@@ -42,7 +43,7 @@ async def get_performance_metrics(
     
     now = datetime.now(timezone.utc)
 
-    if period == "daily":
+    if period in ("daily", "today"):
         start = now - timedelta(days=1)
     elif period == "weekly":
         start = now - timedelta(weeks=1)
@@ -59,6 +60,112 @@ async def get_performance_metrics(
         return metrics
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to calculate metrics: {e}")
+
+
+@router.get("/attribution")
+async def get_attribution(
+    period: str = Query("all_time", pattern="^(daily|today|weekly|monthly|all_time)$")
+):
+    """Get profit attribution by strategy."""
+    now = datetime.now(timezone.utc)
+    if period in ("daily", "today"):
+        start = now - timedelta(days=1)
+    elif period == "weekly":
+        start = now - timedelta(weeks=1)
+    elif period == "monthly":
+        start = now - timedelta(days=30)
+    else:
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    try:
+        attribution = await performance_service.get_attribution(start, now)
+        return {"attribution": attribution}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get attribution: {e}")
+
+
+@router.get("/attribution/strategy/{strategy_id}")
+async def get_strategy_attribution(
+    strategy_id: str,
+    symbol: str = Query("BTCUSDT"),
+    days: int = Query(7, ge=1, le=30),
+    base_mode: str = Query("backtest"),
+    compare_mode: Optional[str] = Query(None),
+    replay_session_id: Optional[str] = Query(None)
+):
+    """Get detailed attribution analysis for a specific strategy."""
+    try:
+        report = await attribution_service.get_strategy_attribution(
+            strategy_id=strategy_id,
+            symbol=symbol,
+            days=days,
+            base_mode=base_mode,
+            compare_mode=compare_mode,
+            replay_session_id=replay_session_id
+        )
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get attribution report: {e}")
+
+
+@router.get("/strategy-comparison")
+async def get_strategy_comparison():
+    """Compare paper trading performance vs latest backtest results."""
+    from app.models.db_models import BacktestResult, TradePair
+    from sqlalchemy import func as sa_func
+
+    async with get_db() as session:
+        # 1. Get paper trading metrics per strategy
+        stmt = (
+            select(
+                TradePair.strategy_id,
+                sa_func.sum(TradePair.pnl).label("total_pnl"),
+                sa_func.count(TradePair.id).label("trade_count"),
+                sa_func.avg(TradePair.pnl_pct).label("win_rate") # Simplification for demo
+            )
+            .where(TradePair.status == "CLOSED")
+            .group_by(TradePair.strategy_id)
+        )
+        paper_res = await session.execute(stmt)
+        paper_data = {row.strategy_id: row for row in paper_res.all() if row.strategy_id}
+
+        # 2. Get latest backtest results for these strategies
+        # We'll map auto_trend_ma -> ma, auto_reversion_rsi -> rsi, etc.
+        strategy_map = {
+            "auto_trend_ma": "ma",
+            "auto_reversion_rsi": "rsi",
+            "auto_volatility_boll": "boll"
+        }
+        
+        comparison = []
+        for auto_id, template_id in strategy_map.items():
+            # Find latest backtest for this template
+            bt_stmt = (
+                select(BacktestResult)
+                .where(BacktestResult.strategy_type == template_id)
+                .order_by(BacktestResult.created_at.desc())
+                .limit(1)
+            )
+            bt_res = await session.execute(bt_stmt)
+            bt_row = bt_res.scalar_one_or_none()
+            
+            paper_row = paper_data.get(auto_id)
+            
+            comparison.append({
+                "strategy_id": auto_id,
+                "strategy_name": template_id.upper(),
+                "paper": {
+                    "total_pnl": float(paper_row.total_pnl or 0.0) if paper_row else 0.0,
+                    "trade_count": int(paper_row.trade_count or 0) if paper_row else 0,
+                },
+                "backtest": {
+                    "total_return": float((bt_row.metrics or {}).get("total_return", 0.0)) if bt_row else 0.0,
+                    "win_rate": float((bt_row.metrics or {}).get("win_rate", 0.0)) if bt_row else 0.0,
+                    "max_drawdown": float((bt_row.metrics or {}).get("max_drawdown", 0.0)) if bt_row else 0.0,
+                } if bt_row else None
+            })
+            
+        return {"comparison": comparison}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +186,7 @@ async def get_equity_curve(
     
     now = datetime.now(timezone.utc)
 
-    if period == "daily":
+    if period in ("daily", "today"):
         start = now - timedelta(days=1)
     elif period == "weekly":
         start = now - timedelta(weeks=1)

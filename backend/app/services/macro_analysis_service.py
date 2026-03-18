@@ -13,14 +13,15 @@ logger = logging.getLogger(__name__)
 class MacroAnalysisService:
     """
     宏观价值分析与配置服务 (Smart Beta)。
-    模拟链上数据：
+    模拟/对接链上数据：
       - Exchange Net Inflow: 交易所净流入 (流入 > 0 抛压大, 流出 < 0 买入强)
       - Whale Accumulation: 大户持仓变化 (增持 > 0, 减持 < 0)
       - Stablecoin Supply: 稳定币供应量变化 (增加 > 0 潜在买盘)
+      - Market Regime: 市场所处周期 (Bull/Bear/Extreme Volatility)
     """
 
     def __init__(self):
-        # 初始模拟数据
+        # 基础模拟数据
         self.base_inflow = 0.0
         self.base_whale = 0.0
         self.base_stable = 0.0
@@ -32,7 +33,6 @@ class MacroAnalysisService:
         -1.0: 极度看空，建议减仓/转换为稳定币
         """
         # 模拟链上指标获取 (实际应调用 Glassnode, CryptoQuant 等 API)
-        # 这里使用带有一定权重的随机模拟来模拟周期
         
         # 交易所流向: 负值表示流出 (利好)
         exchange_inflow = random.uniform(-5000, 5000) 
@@ -59,20 +59,52 @@ class MacroAnalysisService:
         target_exposure = 0.5 + (score * 0.5) 
         target_exposure = max(0.1, min(1.0, target_exposure))
 
+        # 获取当前市场周期
+        regime = await self.get_market_regime(symbol)
+
         return {
             "symbol": symbol,
             "macro_score": round(score, 2),
             "target_exposure": round(target_exposure, 2),
+            "regime": regime,
             "indicators": {
                 "exchange_net_inflow": round(exchange_inflow, 2),
                 "whale_accumulation": round(whale_accumulation, 2),
                 "stablecoin_supply_delta": round(stablecoin_supply_delta, 2)
             },
             "timestamp": datetime.now().isoformat(),
-            "recommendation": self._get_recommendation(score)
+            "recommendation": self._get_recommendation(score, regime)
         }
 
-    def _get_recommendation(self, score: float) -> str:
+    async def get_market_regime(self, symbol: str) -> str:
+        """
+        识别当前市场所处周期。
+        - BULL: 牛市趋势
+        - BEAR: 熊市趋势
+        - SIDEWAYS: 震荡
+        - EXTREME_VOLATILITY: 极端波动（黑天鹅预警）
+        """
+        # 实际应基于 200d MA, VIX-like 波动率等计算
+        # 这里演示逻辑：
+        # 1. 模拟波动率计算
+        volatility = random.uniform(0.1, 1.2) # 10% to 120% 年化
+        
+        if volatility > 0.9:
+            return "EXTREME_VOLATILITY"
+        
+        # 2. 模拟趋势强度
+        trend_strength = random.uniform(-1, 1)
+        if trend_strength > 0.4:
+            return "BULL"
+        elif trend_strength < -0.4:
+            return "BEAR"
+        else:
+            return "SIDEWAYS"
+
+    def _get_recommendation(self, score: float, regime: str) -> str:
+        if regime == "EXTREME_VOLATILITY":
+            return "Risk Off (极端波动，建议清仓/期权对冲)"
+        
         if score > 0.6:
             return "Strong Accumulate (积极定投/持仓)"
         elif score > 0.2:
@@ -82,7 +114,7 @@ class MacroAnalysisService:
         elif score > -0.6:
             return "Reduce (建议减仓)"
         else:
-            return "Risk Off (强制避险/转换为稳定币)"
+            return "Risk Off (建议清仓避险)"
 
 # 单例
 macro_analysis_service = MacroAnalysisService()

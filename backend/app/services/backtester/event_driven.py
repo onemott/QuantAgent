@@ -114,7 +114,15 @@ class EventDrivenBacktester:
 
     def run(self) -> Dict[str, Any]:
         # 1. Generate Signals (Python/Pandas)
+        import inspect
+        import asyncio
         signals = self.signal_func(self.df)
+        if inspect.isawaitable(signals):
+            try:
+                loop = asyncio.get_event_loop()
+                signals = loop.run_until_complete(signals)
+            except Exception:
+                signals = asyncio.run(signals)
         
         # 2. Prepare Data for Numba
         # Ensure contiguous arrays of correct type

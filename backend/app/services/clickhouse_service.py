@@ -326,6 +326,39 @@ class ClickHouseService:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _count)
 
+    # ── Get date range ────────────────────────────────────────────────────────
+    async def get_valid_date_range(self, symbol: str) -> Dict[str, Any]:
+        """Return the min/max dates and unique days with data for a symbol."""
+        import asyncio
+        def _get_range():
+            client = _get_client()
+            if client is None:
+                return {"min_date": None, "max_date": None, "valid_dates": []}
+            try:
+                # Get min/max
+                res_range = client.query(
+                    f"SELECT min(open_time), max(open_time) FROM klines WHERE symbol='{symbol}'"
+                )
+                min_dt, max_dt = res_range.result_rows[0]
+                
+                # Get unique days
+                res_days = client.query(
+                    f"SELECT DISTINCT toDate(open_time) FROM klines WHERE symbol='{symbol}' ORDER BY toDate(open_time)"
+                )
+                valid_dates = [str(r[0]) for r in res_days.result_rows]
+                
+                return {
+                    "min_date": min_dt,
+                    "max_date": max_dt,
+                    "valid_dates": valid_dates
+                }
+            except Exception as e:
+                logger.error(f"ClickHouse get_valid_date_range failed for {symbol}: {e}")
+                return {"min_date": None, "max_date": None, "valid_dates": []}
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get_range)
+
 
 # Singleton
 clickhouse_service = ClickHouseService()

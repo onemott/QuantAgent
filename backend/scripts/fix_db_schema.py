@@ -95,6 +95,67 @@ async def fix_schema():
                  except Exception as e:
                      logger.error(f"Failed to add column {col_name}: {e}")
         
+        # Check 'paper_positions' table for missing columns
+        logger.info("Checking 'paper_positions' table...")
+        pos_columns = [
+            ("strategy_id", "VARCHAR(30)"),
+            ("leverage", "INTEGER DEFAULT 1"),
+            ("liquidation_price", "NUMERIC(20, 8)")
+        ]
+        for col_name, col_type in pos_columns:
+            row = await conn.fetchrow(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='paper_positions' AND column_name='{col_name}';
+            """)
+            if not row:
+                logger.info(f"Adding column '{col_name}' to 'paper_positions'...")
+                try:
+                    await conn.execute(f"ALTER TABLE paper_positions ADD COLUMN {col_name} {col_type};")
+                    logger.info(f"Column '{col_name}' added successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to add column {col_name} to 'paper_positions': {e}")
+
+        # Check 'paper_trades' table
+        logger.info("Checking 'paper_trades' table...")
+        trade_columns = [
+            ("strategy_id", "VARCHAR(30)"),
+            ("client_order_id", "VARCHAR(50)"),
+            ("benchmark_price", "NUMERIC(20, 8)")
+        ]
+        for col_name, col_type in trade_columns:
+            row = await conn.fetchrow(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='paper_trades' AND column_name='{col_name}';
+            """)
+            if not row:
+                logger.info(f"Adding column '{col_name}' to 'paper_trades'...")
+                try:
+                    await conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col_name} {col_type};")
+                    logger.info(f"Column '{col_name}' added successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to add column {col_name} to 'paper_trades': {e}")
+
+        # Check 'trade_pairs' table
+        logger.info("Checking 'trade_pairs' table...")
+        pair_columns = [
+            ("strategy_id", "VARCHAR(30)")
+        ]
+        for col_name, col_type in pair_columns:
+            row = await conn.fetchrow(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='trade_pairs' AND column_name='{col_name}';
+            """)
+            if not row:
+                logger.info(f"Adding column '{col_name}' to 'trade_pairs'...")
+                try:
+                    await conn.execute(f"ALTER TABLE trade_pairs ADD COLUMN {col_name} {col_type};")
+                    logger.info(f"Column '{col_name}' added successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to add column {col_name} to 'trade_pairs': {e}")
+
         await conn.close()
         
     except Exception as e:

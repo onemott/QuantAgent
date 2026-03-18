@@ -3,7 +3,8 @@ QuantAgent OS - FastAPI Backend
 API Gateway for Quantitative Trading Platform
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -71,12 +72,14 @@ async def lifespan(app: FastAPI):
     # Start Ingestion Service (NATS or Local WebSocket)
     try:
         from app.services.ingestion_service import ingestion_service
-        await ingestion_service.start(ws_manager)
-        logger.info("IngestionService started.")
+        # Use asyncio.create_task to avoid blocking startup if NATS is slow
+        asyncio.create_task(ingestion_service.start(ws_manager))
+        logger.info("IngestionService starting (background task)...")
         
         from app.services.trading_worker import trading_worker
-        await trading_worker.start()
-        logger.info("TradingWorker started.")
+        # Use asyncio.create_task to avoid blocking startup if NATS is slow
+        asyncio.create_task(trading_worker.start())
+        logger.info("TradingWorker starting (background task)...")
         
         # Start Polling Loop as Fallback (in case NATS/WS fails)
         ws_manager.start_price_loop()
@@ -137,6 +140,18 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Global exception handler to ensure all errors are returned as JSON.
+    This prevents "Unexpected token 'I' in JSON" errors in the frontend.
+    """
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+    )
 
 app.add_middleware(
     CORSMiddleware,

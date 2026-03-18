@@ -316,7 +316,21 @@ def _run_backtest_engine(
     """
     import numpy as np
 
+    import inspect
     signals = signal_func(df)
+    if inspect.isawaitable(signals):
+        # We need to run it synchronously
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # This should not happen in _run_backtest_engine if called correctly, 
+                # but let's be safe.
+                import nest_asyncio
+                nest_asyncio.apply()
+            signals = loop.run_until_complete(signals)
+        except Exception:
+            signals = asyncio.run(signals)
+    
     capital = initial_capital
     position = 0.0
     entry_price = 0.0

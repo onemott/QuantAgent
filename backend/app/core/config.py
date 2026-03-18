@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     MAX_DAILY_LOSS_PCT: float = 0.05
     PRICE_DEVIATION_PCT: float = 0.05
     
+    # Leverage & Margin (Phase C)
+    MAINTENANCE_MARGIN_RATE: float = 0.05    # 5% maintenance margin
+    MARGIN_WARNING_LEVEL: float = 0.70       # 70% margin usage warning
+    PRE_LIQUIDATION_LEVEL: float = 0.90      # 90% margin usage pre-liquidation trigger
+    VOLATILITY_TARGET_PCT: float = 0.02      # 2% daily volatility target for position sizing
+    
     # Proxy Settings
     HTTP_PROXY: str = ""
     HTTPS_PROXY: str = ""

@@ -114,6 +114,7 @@ services:
       - DEBUG=true
       - HOST=0.0.0.0
       - PORT=8000
+      - BINANCE_PRIVATE_KEY_PATH=/app/Private_key.pem
       # 代理仅用于外部 API，Ollama 本地服务不走代理
       - HTTP_PROXY=http://host.docker.internal:7897
       - HTTPS_PROXY=http://host.docker.internal:7897

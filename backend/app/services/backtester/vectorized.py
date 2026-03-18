@@ -21,7 +21,15 @@ class VectorizedBacktester:
 
     def run(self) -> Dict[str, Any]:
         # 1. Generate Signals
+        import inspect
+        import asyncio
         signals = self.signal_func(self.df)
+        if inspect.isawaitable(signals):
+            try:
+                loop = asyncio.get_event_loop()
+                signals = loop.run_until_complete(signals)
+            except Exception:
+                signals = asyncio.run(signals)
         
         # 2. Calculate Returns
         # Return at time t is (Price[t] - Price[t-1]) / Price[t-1]

@@ -4,7 +4,7 @@ API V1 Router
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import market, trading, auth, strategy, analytics, risk
+from app.api.v1.endpoints import market, trading, auth, strategy, analytics, risk, replay
 
 api_router = APIRouter()
 
@@ -14,3 +14,4 @@ api_router.include_router(trading.router, prefix="/trading", tags=["Trading"])
 api_router.include_router(risk.router, prefix="/risk", tags=["Risk Management"])
 api_router.include_router(strategy.router, prefix="/strategy", tags=["Strategy"])
 api_router.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
+api_router.include_router(replay.router, prefix="/replay", tags=["Historical Replay"])

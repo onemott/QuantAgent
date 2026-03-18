@@ -63,6 +63,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI Dependency for database sessions."""
+    async with get_db() as session:
+        yield session
+
+
 async def init_db():
     """Create all tables if they don't exist (fallback when init-scripts not used)."""
     from app.models.db_models import Base

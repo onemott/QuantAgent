@@ -153,12 +153,17 @@ class IngestionService:
     async def _start_local_stream(self):
         """Connect to Binance WebSocket directly (Fallback) with Exponential Backoff."""
         base_url = "wss://stream.binance.com:9443/stream?streams="
-        # Construct streams: <symbol>@miniTicker / <symbol>@kline_1m
+        
+        # 支持多周期采集: 1m, 5m, 15m, 1h, 4h
+        INTERVALS = ["1m", "5m", "15m", "1h", "4h"]
+        
+        # Construct streams: <symbol>@miniTicker / <symbol>@kline_<interval>
         streams = []
         for s in settings.SYMBOLS:
             symbol = s.lower()
             streams.append(f"{symbol}@miniTicker")
-            streams.append(f"{symbol}@kline_1m") # Default 1m kline
+            for interval in INTERVALS:
+                streams.append(f"{symbol}@kline_{interval}")
         
         url = base_url + "/".join(streams)
         proxy_url = get_proxy_url()
@@ -240,10 +245,12 @@ class IngestionService:
             await self.ws_manager.broadcast_ticker(symbol, payload)
 
     async def _handle_local_kline(self, data: Dict):
-        """Handle local kline data."""
+        """Handle local kline data (support multi-interval)."""
         # Payload: {"k": {...}}
         k = data['k']
         symbol = k['s']
+        interval = k['i']  # Binance provides interval in kline data
+        
         # Normalize
         kline = {
             "timestamp": k['t'] / 1000,
@@ -265,7 +272,7 @@ class IngestionService:
             
         self.last_kline_ts[symbol] = current_ts
         
-        redis_key = f"market:{symbol}:kline:latest"
+        redis_key = f"market:{symbol}:kline:{interval}:latest"
         await redis_set(redis_key, kline, ttl=60)
 
         # If closed, persist to ClickHouse
@@ -279,8 +286,8 @@ class IngestionService:
                 "close": k['c'],
                 "volume": k['v']
             }
-            # Local stream hardcoded to 1m currently in _start_local_stream
-            await self._persist_kline(symbol, "1m", kline_data)
+            # Use interval from Binance kline data
+            await self._persist_kline(symbol, interval, kline_data)
 
     async def _recover_gap(self, symbol: str, start_ts: float, end_ts: float):
         """Recover missing klines via REST API."""

@@ -48,6 +48,14 @@ async def equity_snapshot_task():
     except Exception as e:
         logger.error(f"Error in equity snapshot task: {e}")
 
+async def auto_strategy_task():
+    """Execute automated strategies."""
+    try:
+        from app.services.strategy_runner_service import strategy_runner_service
+        await strategy_runner_service.run_all_strategies()
+    except Exception as e:
+        logger.error(f"Error in auto strategy task: {e}")
+
 async def risk_monitor_task():
     """Run periodic risk checks."""
     try:
@@ -129,6 +137,44 @@ async def calculate_agent_pnl_task():
             
     except Exception as e:
         logger.error(f"Error in PnL backtracking: {e}")
+
+
+# 多周期历史数据补充任务
+async def backfill_multi_interval_task():
+    """
+    定期补充高周期历史数据 (5m, 15m, 1h, 4h, 1d)
+    每小时运行一次，补充过去1小时的数据
+    """
+    INTERVALS = ["5m", "15m", "1h", "4h", "1d"]
+    LOOKBACK_MINUTES = {
+        "5m": 60,
+        "15m": 120,
+        "1h": 120,
+        "4h": 300,
+        "1d": 1440,
+    }
+    
+    logger.info("Starting multi-interval historical data backfill...")
+    
+    for symbol in settings.SYMBOLS:
+        for interval in INTERVALS:
+            try:
+                lookback = LOOKBACK_MINUTES.get(interval, 60)
+                since = int((datetime.now(timezone.utc) - timedelta(minutes=lookback)).timestamp() * 1000)
+                
+                klines = await binance_service.get_klines(
+                    symbol=symbol,
+                    timeframe=interval,
+                    limit=1000,
+                    since=since
+                )
+                
+                if klines:
+                    logger.info(f"Backfilled {len(klines)} bars for {symbol}/{interval}")
+            except Exception as e:
+                logger.warning(f"Failed to backfill {symbol}/{interval}: {e}")
+    
+    logger.info("Multi-interval backfill completed.")
 
 
 # ── Scheduler Service ─────────────────────────────────────────────────────────
@@ -245,6 +291,26 @@ class SchedulerService:
             'interval',
             hours=1,
             id='equity_snapshot',
+            replace_existing=True,
+            max_instances=1
+        )
+
+        # Auto Strategy Execution (Every 5 minutes)
+        self.scheduler.add_job(
+            auto_strategy_task,
+            'interval',
+            minutes=5,
+            id='auto_strategy',
+            replace_existing=True,
+            max_instances=1
+        )
+
+        # Multi-Interval Historical Data Backfill (Every 1 hour)
+        self.scheduler.add_job(
+            backfill_multi_interval_task,
+            'interval',
+            hours=1,
+            id='multi_interval_backfill',
             replace_existing=True,
             max_instances=1
         )

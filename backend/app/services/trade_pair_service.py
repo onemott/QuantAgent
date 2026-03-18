@@ -29,7 +29,7 @@ class TradePairService:
 
     async def on_trade_filled(self, trade_id: int, symbol: str, side: str,
                                quantity: Decimal, price: Decimal, fee: Decimal,
-                               created_at: datetime) -> Optional[Dict]:
+                               created_at: datetime, strategy_id: Optional[str] = None) -> Optional[Dict]:
         """
         Called after a trade is filled. Automatically pairs entry/exit.
         Returns the created or updated TradePair dict, or None.
@@ -47,7 +47,7 @@ class TradePairService:
                     else:
                         # Opening a long position
                         return await self._create_pair(session, trade_id, symbol, "LONG",
-                                                        price, fee, created_at, quantity)
+                                                        price, fee, created_at, quantity, strategy_id)
                 else:  # SELL
                     if existing_pair and existing_pair.side == "LONG":
                         # Closing a long position
@@ -56,7 +56,7 @@ class TradePairService:
                     else:
                         # Opening a short position
                         return await self._create_pair(session, trade_id, symbol, "SHORT",
-                                                        price, fee, created_at, quantity)
+                                                        price, fee, created_at, quantity, strategy_id)
         except Exception as e:
             logger.error(f"Trade pairing failed for trade {trade_id}: {e}")
             return None
@@ -74,11 +74,12 @@ class TradePairService:
 
     async def _create_pair(self, session, trade_id: int, symbol: str, side: str,
                             price: Decimal, fee: Decimal, created_at: datetime,
-                            quantity: Decimal) -> Dict:
+                            quantity: Decimal, strategy_id: Optional[str] = None) -> Dict:
         """Create a new trade pair (opening position)."""
         pair = TradePair(
             pair_id=str(uuid.uuid4()),
             symbol=symbol,
+            strategy_id=strategy_id,
             entry_trade_id=trade_id,
             entry_time=created_at,
             entry_price=price,
@@ -207,6 +208,7 @@ class TradePairService:
         return {
             "pair_id": pair.pair_id,
             "symbol": pair.symbol,
+            "strategy_id": pair.strategy_id,
             "side": pair.side,
             "status": pair.status,
             "entry_trade_id": pair.entry_trade_id,

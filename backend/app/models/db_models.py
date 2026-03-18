@@ -26,12 +26,20 @@ class PaperAccount(Base):
 
 
 class PaperPosition(Base):
-    """Current open positions (one row per symbol)"""
+    """Current open positions (one row per symbol/session)"""
     __tablename__ = "paper_positions"
+    __table_args__ = (
+        Index("idx_paper_positions_session", "session_id"),
+    )
 
-    symbol      = Column(String(20), primary_key=True)
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    symbol      = Column(String(20), nullable=False)
+    session_id  = Column(String(50), nullable=True)   # Added for isolation
+    strategy_id = Column(String(30), nullable=True)   # Added for attribution
     quantity    = Column(Numeric(20, 8), nullable=False, default=0)
     avg_price   = Column(Numeric(20, 8), nullable=False, default=0)
+    leverage    = Column(Integer, nullable=False, default=1)
+    liquidation_price = Column(Numeric(20, 8), nullable=True)
     updated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
@@ -46,6 +54,7 @@ class PaperTrade(Base):
     )
 
     id              = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id     = Column(String(30), nullable=True)   # Added for attribution
     client_order_id = Column(String(50), nullable=True)   # Client-provided order ID for idempotency
     symbol          = Column(String(20), nullable=False)
     side            = Column(String(4),  nullable=False)
@@ -57,6 +66,8 @@ class PaperTrade(Base):
     funding_fee     = Column(Numeric(20, 8), nullable=False, default=0)
     pnl             = Column(Numeric(20, 8), nullable=True)
     status          = Column(String(10), nullable=False, default="FILLED")
+    mode            = Column(String(20), nullable=False, default="paper") # paper | backtest | historical_replay
+    session_id      = Column(String(50), nullable=True) # For historical_replay session_id
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -156,6 +167,7 @@ class TradePair(Base):
     id              = Column(Integer, primary_key=True, autoincrement=True)
     pair_id         = Column(String(36), nullable=False)      # UUID
     symbol          = Column(String(20), nullable=False)
+    strategy_id     = Column(String(30), nullable=True)   # Added for attribution
 
     # Linked trade IDs
     entry_trade_id  = Column(Integer, nullable=False)
@@ -260,3 +272,26 @@ class AuditLog(Base):
     details     = Column(JSONB, nullable=False, default={})
     ip_address  = Column(String(50), nullable=True)
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplaySession(Base):
+    """Historical Replay session configuration and status"""
+    __tablename__ = "replay_sessions"
+    __table_args__ = (
+        Index("idx_replay_session_id", "replay_session_id", unique=True),
+        Index("idx_replay_strategy",   "strategy_id"),
+    )
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    replay_session_id = Column(String(50), nullable=False)
+    strategy_id       = Column(Integer, nullable=False)
+    strategy_type     = Column(String(20), nullable=True) # ma, rsi, etc.
+    params            = Column(JSONB, nullable=True, default={}) # Strategy parameters
+    symbol            = Column(String(20), nullable=False)
+    start_time        = Column(DateTime(timezone=True), nullable=False)
+    end_time          = Column(DateTime(timezone=True), nullable=False)
+    speed             = Column(Integer, nullable=False, default=1) # 1, 10, 60, 100
+    initial_capital   = Column(Float, nullable=False, default=100000.0)
+    status            = Column(String(20), nullable=False, default="pending") # pending, running, completed, failed, paused
+    current_timestamp = Column(DateTime(timezone=True), nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
