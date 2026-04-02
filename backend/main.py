@@ -25,6 +25,131 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Startup Backfill ───────────────────────────────────────────────────────────
+
+INTERVALS_STARTUP = {
+    "1m":  {"days_back": 7,   "ms_delta": 60_000},
+    "5m":  {"days_back": 30,  "ms_delta": 300_000},
+    "15m": {"days_back": 60,  "ms_delta": 900_000},
+    "1h":  {"days_back": 365, "ms_delta": 3_600_000},
+    "4h":  {"days_back": 730, "ms_delta": 14_400_000},
+    "1d":  {"days_back": 1825, "ms_delta": 86_400_000},
+}
+
+BACKFILL_LOCK_KEY = "quantagent:startup_backfill:lock"
+BACKFILL_LOCK_TTL = 3600  # 1 hour
+
+
+async def _acquire_backfill_lock() -> bool:
+    """Try to acquire Redis lock. Returns True if we got the lock."""
+    try:
+        import redis.asyncio as redis
+        from app.core.config import settings
+        r = redis.from_url(settings.REDIS_URL)
+        acquired = await r.set(BACKFILL_LOCK_KEY, "1", ex=BACKFILL_LOCK_TTL, nx=True)
+        await r.aclose()
+        return bool(acquired)
+    except Exception:
+        return False
+
+
+async def _startup_backfill():
+    """
+    On startup, check data completeness and trigger incremental sync if needed.
+    Uses Redis lock to ensure only one instance runs this at a time.
+    """
+    from app.services.clickhouse_service import clickhouse_service
+    from app.services.binance_service import binance_service
+
+    # Try to acquire lock
+    if not await _acquire_backfill_lock():
+        logger.info("Startup backfill: another instance is running, skipping.")
+        return
+
+    logger.info("Startup backfill: checking data completeness...")
+
+    now = datetime.now(timezone.utc)
+    stale_threshold = timedelta(hours=1)
+    needs_sync = []
+
+    for symbol in settings.SYMBOLS:
+        for interval, config in INTERVALS_STARTUP.items():
+            max_ts = await clickhouse_service.get_max_timestamp(symbol, interval)
+            if max_ts is None:
+                # No data at all — needs full backfill
+                needs_sync.append((symbol, interval, "full", config["days_back"]))
+                logger.info(f"  [{symbol}/{interval}] 无数据，需要全量回填")
+            else:
+                diff = now - max_ts
+                if diff > stale_threshold:
+                    needs_sync.append((symbol, interval, "sync", None))
+                    logger.info(f"  [{symbol}/{interval}] 数据过期 (max={max_ts}), 需要增量同步")
+                else:
+                    logger.info(f"  [{symbol}/{interval}] 数据最新 (max={max_ts})")
+
+    if not needs_sync:
+        logger.info("Startup backfill: all data is up-to-date.")
+        return
+
+    logger.info(f"Startup backfill: syncing {len(needs_sync)} symbol/interval pairs...")
+
+    def symbol_to_binance(sym: str) -> str:
+        if '/' in sym:
+            return sym
+        if sym.endswith('USDT'):
+            return f"{sym[:-4]}/USDT"
+        return sym
+
+    total_synced = 0
+    for symbol, interval, mode, days_back in needs_sync:
+        try:
+            config = INTERVALS_STARTUP[interval]
+            if mode == "full":
+                start_dt = now - timedelta(days=days_back)
+                start_ms = int(start_dt.timestamp() * 1000)
+            else:
+                max_ts = await clickhouse_service.get_max_timestamp(symbol, interval)
+                start_ms = int(max_ts.timestamp() * 1000) - config["ms_delta"]
+
+            end_ms = int(now.timestamp() * 1000)
+            current_ms = start_ms
+            count = 0
+
+            while current_ms < end_ms:
+                klines = await binance_service.get_klines(
+                    symbol=symbol_to_binance(symbol),
+                    timeframe=interval,
+                    limit=1000,
+                    since=current_ms,
+                )
+                if not klines:
+                    break
+                rows = [
+                    {
+                        "open_time":  k.timestamp,
+                        "open":       k.open,
+                        "high":       k.high,
+                        "low":        k.low,
+                        "close":      k.close,
+                        "volume":     k.volume,
+                        "close_time": k.close_time,
+                    }
+                    for k in klines
+                ]
+                await clickhouse_service.insert_klines(symbol, interval, rows)
+                count += len(klines)
+                last_ts = klines[-1].timestamp.timestamp() * 1000
+                current_ms = int(last_ts + config["ms_delta"])
+                await asyncio.sleep(0.3)
+
+            logger.info(f"  [{symbol}/{interval}] {mode}: synced {count} bars")
+            total_synced += count
+        except Exception as e:
+            logger.warning(f"  [{symbol}/{interval}] backfill failed: {e}")
+
+    logger.info(f"Startup backfill: done. Total {total_synced} bars synced.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Lifespan
 # ─────────────────────────────────────────────────────────────────────────────
@@ -33,23 +158,45 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("QuantAgent API Server starting up...")
 
-    # Initialize database tables
+    # Run Alembic migrations
     try:
-        from app.services.database import init_db, check_db_connection, check_redis_connection
+        from app.services.database import get_engine, check_db_connection
+        from app.services.alembic_manager import alembic_manager
+
         db_ok = await check_db_connection()
         if db_ok:
-            await init_db()
-            logger.info("PostgreSQL connected and tables verified.")
+            engine = get_engine()
+            await alembic_manager.upgrade_to_head(engine)
+            logger.info("Alembic migrations applied — database schema is up to date.")
         else:
-            logger.warning("PostgreSQL not available - running without persistence.")
+            logger.warning("PostgreSQL not available — running without persistence.")
+    except Exception as e:
+        logger.error(f"Alembic migration failed: {e}")
 
+    # Redis connectivity check (independent of DB)
+    try:
+        from app.services.database import check_redis_connection
         redis_ok = await check_redis_connection()
         if redis_ok:
             logger.info("Redis connected.")
         else:
             logger.warning("Redis not available - running without cache.")
     except Exception as e:
-        logger.error(f"Database/Redis init failed: {e}")
+        logger.error(f"Redis check failed: {e}")
+
+    # Initialize ClickHouse tables and trigger startup backfill
+    try:
+        from app.services.clickhouse_service import clickhouse_service
+        ch_ok = await clickhouse_service.async_init_tables()
+        if ch_ok:
+            logger.info("ClickHouse klines table verified.")
+        else:
+            logger.warning("ClickHouse not available — skipping klines table init.")
+
+        # Startup backfill: async, non-blocking
+        asyncio.create_task(_startup_backfill())
+    except Exception as e:
+        logger.error(f"ClickHouse init failed: {e}")
 
     # Test Binance connectivity
     try:
@@ -68,6 +215,17 @@ async def lifespan(app: FastAPI):
             logger.warning("LLM provider not initialized.")
     except Exception as e:
         logger.error(f"LLM init failed: {e}")
+
+    # Skill 系统初始化
+    try:
+        from app.skills.initializer import initialize_skill_system
+        skill_result = await initialize_skill_system()
+        if skill_result:
+            logger.info("✅ Skill系统初始化成功")
+        else:
+            logger.warning("⚠️ Skill系统初始化返回失败状态")
+    except Exception as e:
+        logger.warning(f"⚠️ Skill系统初始化失败（非关键）: {e}")
 
     # Start Ingestion Service (NATS or Local WebSocket)
     try:

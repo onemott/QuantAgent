@@ -1,7 +1,7 @@
 """
 Market Data Endpoints
 """
-
+import asyncio
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import List, Optional, AsyncGenerator, Dict, Any
@@ -524,3 +524,186 @@ async def check_ollama_status():
             "error": str(e),
             "hint": f"请先安装并启动 Ollama: https://ollama.com/download，然后运行 'ollama run {settings.OLLAMA_MODEL}'"
         }
+
+
+# ── Manual Backfill ─────────────────────────────────────────────────────────────
+
+class BackfillRequest(BaseModel):
+    symbol: Optional[str] = None   # e.g. BTCUSDT, defaults to all
+    interval: Optional[str] = None  # e.g. 1m, 1h, defaults to all
+    mode: str = "sync"              # "full" or "sync"
+
+
+@router.post("/backfill", status_code=202)
+async def trigger_backfill(req: BackfillRequest):
+    """
+    手动触发历史数据补数任务。
+
+    - **symbol**: 币种 (BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, DOGEUSDT)，默认全部
+    - **interval**: 周期 (1m, 5m, 15m, 1h, 4h, 1d)，默认全部
+    - **mode**: "full" (全量回填) 或 "sync" (增量同步)，默认 sync
+    """
+    from app.core.config import settings
+    from app.services.clickhouse_service import clickhouse_service
+
+    VALID_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
+    VALID_SYMBOLS = list(settings.SYMBOLS)
+
+    symbols = [req.symbol] if req.symbol else VALID_SYMBOLS
+    intervals = [req.interval] if req.interval else VALID_INTERVALS
+
+    # Validate
+    symbols = [s for s in symbols if s in VALID_SYMBOLS]
+    intervals = [i for i in intervals if i in VALID_INTERVALS]
+    mode = req.mode if req.mode in ("full", "sync") else "sync"
+
+    if not symbols:
+        raise HTTPException(status_code=400, detail=f"Invalid symbol. Valid: {VALID_SYMBOLS}")
+    if not intervals:
+        raise HTTPException(status_code=400, detail=f"Invalid interval. Valid: {VALID_INTERVALS}")
+
+    # Run backfill as a fire-and-forget background task
+    asyncio.create_task(_run_backfill(symbols, intervals, mode))
+
+    return {
+        "status": "started",
+        "message": f"补数任务已启动: {symbols} x {intervals}, mode={mode}",
+        "symbols": symbols,
+        "intervals": intervals,
+        "mode": mode,
+    }
+
+
+async def _run_backfill(symbols: List[str], intervals: List[str], mode: str):
+    """
+    Background backfill implementation. Writes to ClickHouse for each symbol/interval.
+    """
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+    from app.services.binance_service import binance_service
+    from app.services.clickhouse_service import clickhouse_service
+
+    INTERVALS_CFG = {
+        "1m":  {"days_back": 7,   "ms_delta": 60_000},
+        "5m":  {"days_back": 30,  "ms_delta": 300_000},
+        "15m": {"days_back": 60,  "ms_delta": 900_000},
+        "1h":  {"days_back": 365, "ms_delta": 3_600_000},
+        "4h":  {"days_back": 730, "ms_delta": 14_400_000},
+        "1d":  {"days_back": 1825, "ms_delta": 86_400_000},
+    }
+
+    def to_binance(sym: str) -> str:
+        if '/' in sym:
+            return sym
+        if sym.endswith('USDT'):
+            return f"{sym[:-4]}/USDT"
+        return sym
+
+    now = datetime.now(timezone.utc)
+    total = 0
+
+    for symbol in symbols:
+        for interval in intervals:
+            config = INTERVALS_CFG.get(interval, {})
+            if mode == "full":
+                start_dt = now - timedelta(days=config.get("days_back", 7))
+                start_ms = int(start_dt.timestamp() * 1000)
+            else:
+                max_ts = await clickhouse_service.get_max_timestamp(symbol, interval)
+                if max_ts is None:
+                    start_dt = now - timedelta(days=config.get("days_back", 7))
+                    start_ms = int(start_dt.timestamp() * 1000)
+                else:
+                    start_ms = int(max_ts.timestamp() * 1000) - config.get("ms_delta", 60000)
+
+            end_ms = int(now.timestamp() * 1000)
+            current_ms = start_ms
+            count = 0
+
+            while current_ms < end_ms:
+                try:
+                    klines = await binance_service.get_klines(
+                        symbol=to_binance(symbol),
+                        timeframe=interval,
+                        limit=1000,
+                        since=current_ms,
+                    )
+                    if not klines:
+                        break
+                    rows = [
+                        {
+                            "open_time":  k.timestamp,
+                            "open":       k.open,
+                            "high":       k.high,
+                            "low":        k.low,
+                            "close":      k.close,
+                            "volume":     k.volume,
+                            "close_time": k.close_time,
+                        }
+                        for k in klines
+                    ]
+                    await clickhouse_service.insert_klines(symbol, interval, rows)
+                    count += len(klines)
+                    last_ts = klines[-1].timestamp.timestamp() * 1000
+                    current_ms = int(last_ts + config.get("ms_delta", 60000))
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"[backfill] {symbol}/{interval} batch failed: {e}")
+                    break
+
+            logger.info(f"[backfill] {symbol}/{interval} ({mode}): wrote {count} bars")
+            total += count
+
+    logger.info(f"[backfill] All done. Total {total} bars written.")
+
+
+# ── Data Range Health Check ──────────────────────────────────────────────────────
+
+@router.get("/backfill/status")
+async def backfill_status():
+    """
+    返回所有币种/周期的数据范围摘要（用于前端展示数据完整性状态）。
+    """
+    from app.services.clickhouse_service import clickhouse_service
+    from app.core.config import settings
+
+    VALID_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
+    ranges = await clickhouse_service.get_all_data_ranges()
+
+    # Build a dict keyed by symbol/interval
+    data_map: Dict[str, Dict[str, Any]] = {}
+    for r in ranges:
+        key = f"{r['symbol']}/{r['interval']}"
+        data_map[key] = r
+
+    # Fill in missing symbol/interval combos
+    for sym in settings.SYMBOLS:
+        for iv in VALID_INTERVALS:
+            key = f"{sym}/{iv}"
+            if key not in data_map:
+                data_map[key] = {
+                    "symbol": sym,
+                    "interval": iv,
+                    "min_time": None,
+                    "max_time": None,
+                    "row_count": 0,
+                }
+
+    # Check staleness
+    now = datetime.now(timezone.utc)
+    stale_threshold = timedelta(hours=1)
+
+    result = []
+    for key, info in sorted(data_map.items()):
+        max_t = info.get("max_time")
+        stale = False
+        if max_t is not None:
+            if isinstance(max_t, datetime):
+                stale = (now - max_t) > stale_threshold
+            else:
+                # ClickHouse may return naive datetime
+                import re
+                stale = False  # defer
+        result.append({**info, "stale": stale})
+
+    return {"intervals": result, "checked_at": now.isoformat()}

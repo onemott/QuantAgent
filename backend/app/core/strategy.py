@@ -1,6 +1,9 @@
+import logging
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 from app.models.trading import BarData, TickData, OrderRequest, OrderResult
+
+logger = logging.getLogger(__name__)
 
 class BaseStrategy(ABC):
     """
@@ -32,4 +35,5 @@ class BaseStrategy(ABC):
 
     def log(self, message: str, level: str = "INFO"):
         """Logging utility for strategies"""
-        print(f"[{level}] [Strategy:{self.strategy_id}] {message}")
+        log_func = getattr(logger, level.lower(), logger.info)
+        log_func(f"[Strategy:{self.strategy_id}] {message}")

@@ -3,6 +3,7 @@ Task Scheduler Service
 Manages periodic background tasks using APScheduler.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -10,8 +11,9 @@ from apscheduler.jobstores.redis import RedisJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from app.core.config import settings
 from app.services.database import get_db
-from app.models.db_models import AgentMemory
 from app.services.binance_service import binance_service
+from app.services.clickhouse_service import clickhouse_service
+from app.models.db_models import AgentMemory
 from sqlalchemy import select
 from urllib.parse import urlparse
 
@@ -139,42 +141,137 @@ async def calculate_agent_pnl_task():
         logger.error(f"Error in PnL backtracking: {e}")
 
 
-# 多周期历史数据补充任务
+# ── Multi-Interval Backfill Task (standalone helpers) ────────────────────────
+
+INTERVALS_BACKFILL = {
+    "1m":  {"days_back": 7,   "batch_limit": 1000, "ms_delta": 60_000},
+    "5m":  {"days_back": 30,  "batch_limit": 1000, "ms_delta": 300_000},
+    "15m": {"days_back": 60,  "batch_limit": 1000, "ms_delta": 900_000},
+    "1h":  {"days_back": 365, "batch_limit": 1000, "ms_delta": 3_600_000},
+    "4h":  {"days_back": 730, "batch_limit": 1000, "ms_delta": 14_400_000},
+    "1d":  {"days_back": 1825, "batch_limit": 1000, "ms_delta": 86_400_000},
+}
+
+
+def symbol_to_binance(symbol: str) -> str:
+    if '/' in symbol:
+        return symbol
+    if symbol.endswith('USDT'):
+        return f"{symbol[:-4]}/USDT"
+    return symbol
+
+
+async def _backfill_interval_batch(
+    symbol_clickhouse: str,
+    interval: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> int:
+    """Fetch and write one batch of klines. Returns number fetched."""
+    symbol_binance = symbol_to_binance(symbol_clickhouse)
+    config = INTERVALS_BACKFILL.get(interval, {})
+    batch_limit = config.get("batch_limit", 1000)
+
+    klines = await binance_service.get_klines(
+        symbol=symbol_binance,
+        timeframe=interval,
+        limit=batch_limit,
+        since=start_ms,
+    )
+    if not klines:
+        return 0
+
+    rows = [
+        {
+            "open_time":  k.timestamp,
+            "open":       k.open,
+            "high":       k.high,
+            "low":        k.low,
+            "close":      k.close,
+            "volume":     k.volume,
+            "close_time": k.close_time,
+        }
+        for k in klines
+    ]
+    await clickhouse_service.insert_klines(symbol_clickhouse, interval, rows)
+    return len(klines)
+
+
+async def _sync_symbol_interval(symbol: str, interval: str) -> int:
+    """Incrementally sync one symbol/interval. Returns total rows written."""
+    config = INTERVALS_BACKFILL.get(interval)
+    if not config:
+        return 0
+
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+
+    max_ts = await clickhouse_service.get_max_timestamp(symbol, interval)
+    if max_ts is None:
+        # No data — full backfill
+        start_dt = now - timedelta(days=config["days_back"])
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int(now.timestamp() * 1000)
+    else:
+        # Start slightly before max to ensure continuity
+        ms_delta = config["ms_delta"]
+        start_ms = int(max_ts.timestamp() * 1000) - ms_delta
+        end_ms = int(now.timestamp() * 1000)
+
+        diff_min = (now - max_ts).total_seconds() / 60
+        if diff_min < 5:
+            logger.debug(f"[{symbol}/{interval}] already up-to-date, skip")
+            return 0
+
+    total = 0
+    current_ms = start_ms
+    while current_ms < end_ms:
+        fetched = await _backfill_interval_batch(
+            symbol, interval, start_ms=current_ms, end_ms=end_ms
+        )
+        if fetched == 0:
+            break
+        total += fetched
+        # Advance cursor
+        last = None
+        # Re-fetch last timestamp from the batch we just wrote
+        rows = await clickhouse_service.query_klines(
+            symbol, interval,
+            start=datetime.fromtimestamp(current_ms / 1000, tz=timezone.utc),
+            end=datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc),
+            limit=1,
+        )
+        if rows:
+            last = rows[-1]["open_time"]
+        if last:
+            current_ms = int(last.timestamp() * 1000) + config["ms_delta"]
+        else:
+            break
+        await asyncio.sleep(0.3)
+
+    return total
+
+
 async def backfill_multi_interval_task():
     """
-    定期补充高周期历史数据 (5m, 15m, 1h, 4h, 1d)
-    每小时运行一次，补充过去1小时的数据
+    增量同步所有币种/周期数据到最新。
+    每5分钟运行一次，从各 symbol/interval 的最大时间戳开始拉取最新数据。
     """
-    INTERVALS = ["5m", "15m", "1h", "4h", "1d"]
-    LOOKBACK_MINUTES = {
-        "5m": 60,
-        "15m": 120,
-        "1h": 120,
-        "4h": 300,
-        "1d": 1440,
-    }
-    
-    logger.info("Starting multi-interval historical data backfill...")
-    
+    logger.info("Starting incremental backfill for all symbols/intervals...")
+
     for symbol in settings.SYMBOLS:
-        for interval in INTERVALS:
+        for interval in INTERVALS_BACKFILL.keys():
             try:
-                lookback = LOOKBACK_MINUTES.get(interval, 60)
-                since = int((datetime.now(timezone.utc) - timedelta(minutes=lookback)).timestamp() * 1000)
-                
-                klines = await binance_service.get_klines(
-                    symbol=symbol,
-                    timeframe=interval,
-                    limit=1000,
-                    since=since
-                )
-                
-                if klines:
-                    logger.info(f"Backfilled {len(klines)} bars for {symbol}/{interval}")
+                total = await _sync_symbol_interval(symbol, interval)
+                if total > 0:
+                    logger.info(f"Backfill [{symbol}/{interval}]: synced {total} bars")
+                else:
+                    logger.debug(f"Backfill [{symbol}/{interval}]: up-to-date")
             except Exception as e:
-                logger.warning(f"Failed to backfill {symbol}/{interval}: {e}")
-    
-    logger.info("Multi-interval backfill completed.")
+                logger.warning(f"Backfill [{symbol}/{interval}] failed: {e}")
+
+    logger.info("Incremental backfill completed.")
 
 
 # ── Scheduler Service ─────────────────────────────────────────────────────────
@@ -305,11 +402,11 @@ class SchedulerService:
             max_instances=1
         )
 
-        # Multi-Interval Historical Data Backfill (Every 1 hour)
+        # Incremental Historical Data Backfill (Every 5 minutes)
         self.scheduler.add_job(
             backfill_multi_interval_task,
             'interval',
-            hours=1,
+            minutes=5,
             id='multi_interval_backfill',
             replace_existing=True,
             max_instances=1

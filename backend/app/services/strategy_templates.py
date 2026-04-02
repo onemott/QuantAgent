@@ -1,33 +1,45 @@
 """
-Strategy Templates Registry
-Defines reusable trading strategy templates with configurable parameters.
-Each template provides:
-  - metadata (name, description, param definitions)
-  - signal_func(df, **params) -> pd.Series
+策略模板注册中心
+定义可复用的交易策略模板，支持参数化配置。
+每个模板提供：
+  - 元数据（名称、描述、参数定义）
+  - signal_func(df, **params) -> pd.Series（信号生成函数）
 
-Supported strategies:
-  - ma          : MA Golden/Death Cross
-  - rsi         : RSI Overbought/Oversold
-  - boll        : Bollinger Bands Mean Reversion
-  - macd        : MACD Signal Line Crossover
-  - ema_triple  : Triple EMA System (fast/mid/slow)
-  - atr_trend   : ATR-based Trend Following with dynamic stop-loss
+支持的策略：
+  - ma          : 均线金叉/死叉
+  - rsi         : RSI 超买/超卖
+  - boll        : 布林带均值回归
+  - macd        : MACD 信号线交叉
+  - ema_triple  : 三线 EMA 系统（快/中/慢）
+  - atr_trend   : ATR 趋势追踪（动态止损）
+  - turtle      : 海龟交易法则（唐奇安通道突破）
+  - ichimoku    : 一目均衡表趋势策略
+  - smart_beta  : 宏观价值配置策略（异步，不支持历史回放）
+  - basis       : 期现套利策略（异步，不支持历史回放）
 """
 
+import logging
 import pandas as pd
 import numpy as np
-from typing import Any, Dict, List, Callable
+from typing import Any, Dict, List, Callable, Optional
+from datetime import datetime, timezone
 
 from app.services.indicators import sma, ema, rsi, bollinger_bands, macd, atr, donchian_channels, ichimoku_cloud
 from app.services.macro_analysis_service import macro_analysis_service
 
+logger = logging.getLogger(__name__)
+
+# 内存缓存：存储从数据库加载的自定义默认参数（首次访问时刷新）
+_db_default_params_cache: Dict[str, Dict[str, float]] = {}
+_cache_initialized = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Signal Functions
+# 信号生成函数
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ma_cross_signal(df: pd.DataFrame, fast_period: int = 10, slow_period: int = 30) -> pd.Series:
-    """MA Golden/Death Cross: buy on golden cross, sell on death cross."""
+    """均线金叉/死叉：金叉买入，死叉卖出。"""
     result = df.copy()
     result = sma(result, fast_period)
     result = sma(result, slow_period)
@@ -36,12 +48,14 @@ def _ma_cross_signal(df: pd.DataFrame, fast_period: int = 10, slow_period: int =
     fast_ma = result[fast_col]
     slow_ma = result[slow_col]
 
+    # 金叉：快线上穿慢线
     cross_up   = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
+    # 死叉：快线下穿慢线
     cross_down = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
 
     signals = pd.Series(0, index=df.index)
-    signals[cross_up]   = 1
-    signals[cross_down] = -1
+    signals[cross_up]   = 1   # 买入信号
+    signals[cross_down] = -1  # 卖出信号
     return signals
 
 
@@ -51,19 +65,19 @@ def _rsi_signal(
     oversold: float = 30.0,
     overbought: float = 70.0,
 ) -> pd.Series:
-    """RSI overbought/oversold: buy below oversold, sell above overbought."""
+    """RSI 超买/超卖：低于超卖线买入，高于超买线卖出。"""
     result = rsi(df.copy(), rsi_period)
     col = f"rsi_{rsi_period}"
     rsi_vals = result[col]
 
-    # Buy signal: RSI crosses UP through oversold threshold
+    # 买入信号：RSI 向上穿过超卖阈值
     buy  = (rsi_vals < oversold) & (rsi_vals.shift(1) >= oversold)
-    # Sell signal: RSI crosses DOWN through overbought threshold
+    # 卖出信号：RSI 向下穿过超买阈值
     sell = (rsi_vals > overbought) & (rsi_vals.shift(1) <= overbought)
 
     signals = pd.Series(0, index=df.index)
-    signals[buy]  = 1
-    signals[sell] = -1
+    signals[buy]  = 1   # 买入信号
+    signals[sell] = -1  # 卖出信号
     return signals
 
 
@@ -74,16 +88,18 @@ def _boll_signal(
     buy_pct_b: float = 0.0,
     sell_pct_b: float = 1.0,
 ) -> pd.Series:
-    """Bollinger Bands mean-reversion: buy at lower band, sell at upper band."""
+    """布林带均值回归：触碰下轨买入，触碰上轨卖出。"""
     result = bollinger_bands(df.copy(), period=period, std_dev=std_dev)
     pct_b = result["boll_pct_b"]
 
+    # 价格跌破下轨（%B <= 0）时买入
     buy  = (pct_b <= buy_pct_b)  & (pct_b.shift(1) > buy_pct_b)
+    # 价格突破上轨（%B >= 1）时卖出
     sell = (pct_b >= sell_pct_b) & (pct_b.shift(1) < sell_pct_b)
 
     signals = pd.Series(0, index=df.index)
-    signals[buy]  = 1
-    signals[sell] = -1
+    signals[buy]  = 1   # 买入信号
+    signals[sell] = -1  # 卖出信号
     return signals
 
 
@@ -94,21 +110,23 @@ def _macd_signal(
     signal_period: int = 9,
 ) -> pd.Series:
     """
-    MACD Signal Line Crossover:
-    - Buy when DIF crosses above DEA (golden cross)
-    - Sell when DIF crosses below DEA (death cross)
-    Also requires MACD histogram to confirm momentum direction.
+    MACD 信号线交叉策略：
+    - 买入：DIF 线上穿 DEA 信号线（金叉）
+    - 卖出：DIF 线下穿 DEA 信号线（死叉）
+    结合 MACD 柱状图确认动量方向。
     """
     result = macd(df.copy(), fast=fast, slow=slow, signal=signal_period)
     dif = result["macd_dif"]
     dea = result["macd_dea"]
 
+    # 金叉：DIF 上穿 DEA
     cross_up   = (dif > dea) & (dif.shift(1) <= dea.shift(1))
+    # 死叉：DIF 下穿 DEA
     cross_down = (dif < dea) & (dif.shift(1) >= dea.shift(1))
 
     signals = pd.Series(0, index=df.index)
-    signals[cross_up]   = 1
-    signals[cross_down] = -1
+    signals[cross_up]   = 1   # 买入信号
+    signals[cross_down] = -1  # 卖出信号
     return signals
 
 
@@ -119,10 +137,10 @@ def _ema_triple_signal(
     slow_period: int = 60,
 ) -> pd.Series:
     """
-    Triple EMA Trend System:
-    - Buy when fast EMA > mid EMA > slow EMA (all aligned upward)
-    - Sell when fast EMA < mid EMA (trend breaks down)
-    Uses three EMAs to filter noise and follow strong trends.
+    三线 EMA 趋势系统：
+    - 买入：快线 > 中线 > 慢线（三线多头排列）
+    - 卖出：快线跌破中线（趋势破坏）
+    通过三条 EMA 过滤噪音，追踪强趋势行情。
     """
     result = df.copy()
     result = ema(result, fast_period)
@@ -133,17 +151,17 @@ def _ema_triple_signal(
     mid_e  = result[f"ema_{mid_period}"]
     slow_e = result[f"ema_{slow_period}"]
 
-    # Bullish alignment: fast > mid > slow
+    # 多头排列：快线 > 中线 > 慢线
     bull_aligned  = (fast_e > mid_e) & (mid_e > slow_e)
     bull_prev     = (fast_e.shift(1) > mid_e.shift(1)) & (mid_e.shift(1) > slow_e.shift(1))
-    buy           = bull_aligned & ~bull_prev  # transition into bull state
+    buy           = bull_aligned & ~bull_prev  # 刚进入多头排列状态
 
-    # Exit: fast crosses below mid
+    # 退出信号：快线下穿中线
     bear_entry    = (fast_e < mid_e) & (fast_e.shift(1) >= mid_e.shift(1))
 
     signals = pd.Series(0, index=df.index)
-    signals[buy]        = 1
-    signals[bear_entry] = -1
+    signals[buy]        = 1   # 买入信号
+    signals[bear_entry] = -1  # 卖出信号
     return signals
 
 
@@ -154,33 +172,33 @@ def _atr_trend_signal(
     trend_period: int = 20,
 ) -> pd.Series:
     """
-    ATR-based Trend Following with Chandelier Exit:
-    - Entry: price breaks above the highest high of trend_period candles
-    - Exit: price drops more than atr_multiplier × ATR below recent high (chandelier stop)
-    Suitable for strong trending markets; avoids choppy sideways action.
+    ATR 趋势追踪策略（吊灯出场法）：
+    - 入场：价格突破 trend_period 周期最高价
+    - 出场：价格跌破（近期最高价 - atr_multiplier × ATR）的动态止损线
+    适合强趋势、高波动市场，可有效规避横盘震荡。
     """
     result = atr(df.copy(), period=atr_period)
     atr_vals   = result[f"atr_{atr_period}"]
     close      = result["close"]
     high       = result["high"]
 
-    # Trend entry: close breaks above rolling highest high
+    # 趋势入场：价格突破滚动最高价
     highest    = high.rolling(window=trend_period).max()
     breakout   = (close > highest.shift(1))
 
-    # Chandelier exit: close drops below (rolling high - multiplier × ATR)
-    rolling_high   = high.rolling(window=atr_period).max()
+    # 吊灯出场：价格跌破（滚动最高价 - 倍数 × ATR）
+    rolling_high    = high.rolling(window=atr_period).max()
     chandelier_stop = rolling_high - atr_multiplier * atr_vals
-    exit_signal    = close < chandelier_stop
+    exit_signal     = close < chandelier_stop
 
     signals = pd.Series(0, index=df.index)
     in_position = False
     for i in range(len(signals)):
         if not in_position and bool(breakout.iloc[i]):
-            signals.iloc[i] = 1
+            signals.iloc[i] = 1   # 突破入场
             in_position = True
         elif in_position and bool(exit_signal.iloc[i]):
-            signals.iloc[i] = -1
+            signals.iloc[i] = -1  # 吊灯止损出场
             in_position = False
 
     return signals
@@ -192,32 +210,34 @@ def _turtle_signal(
     exit_period: int = 10,
 ) -> pd.Series:
     """
-    Turtle Trading Rules (simplified):
-    - Entry: Close breaks above the highest high of entry_period (System 1: 20, System 2: 55)
-    - Exit: Close breaks below the lowest low of exit_period (System 1: 10, System 2: 20)
-    Uses Donchian Channels for breakout detection.
+    海龟交易法则（简化版）：
+    - 入场：收盘价突破 entry_period 周期最高价（System 1: 20，System 2: 55）
+    - 出场：收盘价跌破 exit_period 周期最低价（System 1: 10，System 2: 20）
+    使用唐奇安通道进行突破检测。
     """
+    # 计算入场通道（上轨）
     result = donchian_channels(df.copy(), period=entry_period)
     upper_band = result["donchian_upper"]
     
-    # We need a different period for exit
+    # 计算出场通道（下轨，使用不同周期）
     exit_result = donchian_channels(df.copy(), period=exit_period)
     lower_band = exit_result["donchian_lower"]
     
     close = df["close"]
     
-    # Signals
+    # 入场信号：突破上轨
     buy_signal  = (close > upper_band.shift(1))
+    # 出场信号：跌破下轨
     exit_signal = (close < lower_band.shift(1))
     
     signals = pd.Series(0, index=df.index)
     in_position = False
     for i in range(len(signals)):
         if not in_position and bool(buy_signal.iloc[i]):
-            signals.iloc[i] = 1
+            signals.iloc[i] = 1   # 突破入场
             in_position = True
         elif in_position and bool(exit_signal.iloc[i]):
-            signals.iloc[i] = -1
+            signals.iloc[i] = -1  # 跌破出场
             in_position = False
             
     return signals
@@ -230,33 +250,33 @@ def _ichimoku_trend_signal(
     senkou_b_period: int = 52,
 ) -> pd.Series:
     """
-    Ichimoku Cloud Trend Following:
-    - Buy: Price > Span A AND Price > Span B (above cloud) AND Tenkan > Kijun
-    - Exit: Price < Kijun (trend weakens)
-    Captures strong momentum and trend direction.
+    一目均衡表趋势策略：
+    - 买入：价格 > 先行带 A 且价格 > 先行带 B（位于云层之上）且转折线 > 基准线（金叉）
+    - 出场：价格跌破基准线（趋势减弱）
+    综合判断趋势强度和动量方向。
     """
     result = ichimoku_cloud(df.copy(), tenkan_period, kijun_period, senkou_b_period)
     close  = result["close"]
-    tenkan = result["ichi_tenkan"]
-    kijun  = result["ichi_kijun"]
-    span_a = result["ichi_span_a"]
-    span_b = result["ichi_span_b"]
+    tenkan = result["ichi_tenkan"]  # 转折线
+    kijun  = result["ichi_kijun"]   # 基准线
+    span_a = result["ichi_span_a"]  # 先行带 A
+    span_b = result["ichi_span_b"]  # 先行带 B
     
-    # Bullish state: above cloud + golden cross
-    above_cloud = (close > span_a) & (close > span_b)
+    # 多头状态：位于云层之上 + 金叉
+    above_cloud  = (close > span_a) & (close > span_b)
     golden_cross = (tenkan > kijun)
     
-    buy_signal = above_cloud & golden_cross
-    exit_signal = (close < kijun)
+    buy_signal  = above_cloud & golden_cross
+    exit_signal = (close < kijun)  # 跌破基准线视为趋势减弱
     
     signals = pd.Series(0, index=df.index)
     in_position = False
     for i in range(len(signals)):
         if not in_position and bool(buy_signal.iloc[i]):
-            signals.iloc[i] = 1
+            signals.iloc[i] = 1   # 云层上方金叉买入
             in_position = True
         elif in_position and bool(exit_signal.iloc[i]):
-            signals.iloc[i] = -1
+            signals.iloc[i] = -1  # 跌破基准线出场
             in_position = False
             
     return signals
@@ -269,30 +289,31 @@ async def _smart_beta_signal(
     sell_threshold: float = -0.3,
 ) -> pd.Series:
     """
-    Smart Beta Strategy based on Macro Analysis:
-    - Uses on-chain data (exchange inflows, whale accumulation, etc.)
-    - Buy: Macro Score > buy_threshold
-    - Sell: Macro Score < sell_threshold
-    - Risk Off: Automatically handled if Regime is EXTREME_VOLATILITY (returns -1)
+    宏观价值配置策略（Smart Beta）：
+    - 利用链上数据（交易所流向、大户积累等）生成信号
+    - 买入：宏观评分 > buy_threshold
+    - 卖出：宏观评分 < sell_threshold
+    - 极端波动时自动触发风险规避（返回 -1）
+    注意：此策略为异步策略，不支持历史回放。
     """
-    # Note: In a real backtest, this should use historical macro data.
-    # For live/paper trading, we get the current macro score.
+    # 注意：真实回测中应使用历史宏观数据。
+    # 实盘/模拟盘中使用当前宏观评分。
     macro_info = await macro_analysis_service.get_macro_score(symbol)
-    score = macro_info.get("macro_score", 0.0)
+    score  = macro_info.get("macro_score", 0.0)
     regime = macro_info.get("regime", "SIDEWAYS")
     
     signals = pd.Series(0, index=df.index)
     
-    # If in extreme volatility, force a sell/risk-off signal
+    # 极端波动市场：强制卖出/风险规避
     if regime == "EXTREME_VOLATILITY":
         signals.iloc[-1] = -1
         return signals
         
-    # Standard threshold-based signals
+    # 基于阈值的标准信号逻辑
     if score > buy_threshold:
-        signals.iloc[-1] = 1
+        signals.iloc[-1] = 1   # 宏观评分高，买入
     elif score < sell_threshold:
-        signals.iloc[-1] = -1
+        signals.iloc[-1] = -1  # 宏观评分低，卖出
         
     return signals
 
@@ -300,40 +321,44 @@ async def _smart_beta_signal(
 async def _basis_trading_signal(
     df: pd.DataFrame,
     symbol: str = "BTCUSDT",
-    min_funding_rate: float = 0.0001, # 0.01%
+    min_funding_rate: float = 0.0001,  # 最低资金费率 0.01%
 ) -> pd.Series:
     """
-    Basis Trading (Arbitrage) Strategy:
-    - Long Spot, Short Perpetual to collect funding fees.
-    - Simplified logic: buy if funding rate > min_funding_rate.
+    期现套利策略（Basis Trading）：
+    - 做多现货 + 做空永续合约，赚取资金费率收益
+    - 简化逻辑：资金费率 > min_funding_rate 时买入现货
+    注意：此策略为异步策略，不支持历史回放。
     """
-    # In a real system, we'd fetch the actual funding rate from Binance.
-    # Here we simulate/fetch the current funding rate.
+    # 实际系统中应从 Binance 获取真实资金费率
+    # 此处模拟获取当前资金费率
     from app.services.binance_service import binance_service
     
     try:
-        # 模拟获取资金费率
+        # 模拟获取资金费率（实际可调用 API）
         # funding_info = await binance_service.get_funding_rate(symbol)
         # funding_rate = float(funding_info.get("lastFundingRate", 0))
-        funding_rate = 0.0003 # 模拟为 0.03%
+        funding_rate = 0.0003  # 模拟为 0.03%
     except Exception:
         funding_rate = 0.0
         
     signals = pd.Series(0, index=df.index)
     
     if funding_rate > min_funding_rate:
-        # Buy Spot (Signal = 1) and Sell Future (handled by execution logic)
+        # 资金费率为正且超过阈值：买入现货（做空合约由执行层处理）
         signals.iloc[-1] = 1
     elif funding_rate < 0:
-        # Funding is negative, exit the basis trade
+        # 资金费率为负：退出套利仓位
         signals.iloc[-1] = -1
         
     return signals
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Template Registry
+# 策略模板注册表
 # ─────────────────────────────────────────────────────────────────────────────
+
+# 异步策略集合（依赖实时数据，不支持历史回放）
+ASYNC_STRATEGIES = {"smart_beta", "basis"}
 
 STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "ma": {
@@ -654,32 +679,331 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
 
 
 def get_template(strategy_type: str) -> Dict[str, Any]:
-    """Return template definition (without the callable signal_func)."""
+    """根据策略类型返回模板定义（不含可调用的 signal_func）。"""
     t = STRATEGY_TEMPLATES.get(strategy_type)
     if t is None:
-        raise ValueError(f"Unknown strategy type: {strategy_type}. Available: {list(STRATEGY_TEMPLATES.keys())}")
+        raise ValueError(f"未知策略类型: {strategy_type}。可用策略: {list(STRATEGY_TEMPLATES.keys())}")
     return t
 
 
-def get_all_templates_meta() -> List[Dict[str, Any]]:
-    """Return template metadata list (safe for JSON serialization, no callables)."""
+def update_template_default_params(
+    strategy_type: str, 
+    new_params: Dict[str, Any],
+    updated_by: str = "optimization"
+) -> Dict[str, Any]:
+    """
+    更新策略模板的参数默认值。
+    允许将优化后的参数保存为新的默认值。
+    
+    同时保存到：
+    1. 内存缓存（快速访问）
+    2. 数据库（跨重启持久化）
+    
+    Args:
+        strategy_type: 策略标识符（如 "ma", "rsi"）
+        new_params: 参数键到新默认值的映射字典
+        updated_by: 更新来源（"optimization", "manual_backtest", "manual_replay"）
+        
+    Returns:
+        更新后的模板定义
+        
+    Raises:
+        ValueError: 策略类型未知或参数键无效时抛出
+    """
+    global _db_default_params_cache
+    
+    if strategy_type not in STRATEGY_TEMPLATES:
+        raise ValueError(f"未知策略类型: {strategy_type}。可用策略: {list(STRATEGY_TEMPLATES.keys())}")
+    
+    template = STRATEGY_TEMPLATES[strategy_type]
+    valid_keys = {p["key"] for p in template["params"]}
+    
+    # 校验参数键合法性
+    for key, value in new_params.items():
+        if key not in valid_keys:
+            raise ValueError(f"策略 '{strategy_type}' 中不存在参数 '{key}'。有效参数: {valid_keys}")
+    
+    # 更新内存缓存
+    if strategy_type not in _db_default_params_cache:
+        _db_default_params_cache[strategy_type] = {}
+    
+    # 收集需要批量保存的参数
+    params_to_save = {}
+    
+    # 更新默认值并收集待保存参数
+    for param in template["params"]:
+        key = param["key"]
+        if key in new_params:
+            # 按参数类型进行类型转换
+            if param["type"] == "int":
+                param["default"] = int(new_params[key])
+            elif param["type"] == "float":
+                param["default"] = float(new_params[key])
+            else:
+                param["default"] = new_params[key]
+            
+            # 更新内存缓存
+            _db_default_params_cache[strategy_type][key] = param["default"]
+            params_to_save[key] = param["default"]
+    
+    # 在单一事务中批量保存所有参数到数据库
+    if params_to_save:
+        _save_all_params_to_db(strategy_type, params_to_save, updated_by)
+    
+    return template
+
+
+def _load_db_default_params() -> Dict[str, Dict[str, float]]:
+    """从数据库加载自定义默认参数。"""
+    global _db_default_params_cache, _cache_initialized
+    
+    # 已初始化则直接返回缓存
+    if _cache_initialized:
+        return _db_default_params_cache
+    
+    try:
+        from app.services.database import get_db
+        from app.models.db_models import StrategyDefaultParam
+        from sqlalchemy import select
+        
+        _db_default_params_cache = {}
+        
+        async def _fetch():
+            async with get_db() as session:
+                stmt = select(StrategyDefaultParam)
+                result = await session.execute(stmt)
+                rows = result.scalars().all()
+                
+                for row in rows:
+                    if row.strategy_type not in _db_default_params_cache:
+                        _db_default_params_cache[row.strategy_type] = {}
+                    _db_default_params_cache[row.strategy_type][row.param_key] = float(row.param_value)
+                
+                _cache_initialized = True
+                logger.info(f"从数据库加载了 {len(rows)} 条自定义默认参数: {_db_default_params_cache}")
+        
+        # 在同步模块中运行异步函数
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 已在异步上下文中，通过线程池创建新事件循环
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _fetch())
+                    future.result()
+            else:
+                loop.run_until_complete(_fetch())
+        except Exception as e:
+            logger.warning(f"无法加载数据库默认参数（数据库可能尚未就绪）: {e}")
+            _cache_initialized = True  # 标记已初始化，避免重试
+    
+    except ImportError as e:
+        logger.warning(f"无法导入数据库模块: {e}")
+        _cache_initialized = True
+    
+    return _db_default_params_cache
+
+
+def _save_param_to_db(strategy_type: str, param_key: str, param_value: float, updated_by: str = "system") -> None:
+    """保存单个参数到数据库。"""
+    try:
+        from app.services.database import get_db
+        from app.models.db_models import StrategyDefaultParam, StrategyParamHistory
+        from sqlalchemy import select
+        
+        async def _save():
+            async with get_db() as session:
+                # 查询是否已存在记录
+                stmt = select(StrategyDefaultParam).where(
+                    StrategyDefaultParam.strategy_type == strategy_type,
+                    StrategyDefaultParam.param_key == param_key
+                )
+                result = await session.execute(stmt)
+                existing = result.scalar_one_or_none()
+                
+                old_value = float(existing.param_value) if existing else None
+                
+                if existing:
+                    # 更新已有记录
+                    existing.param_value = param_value
+                    existing.updated_by = updated_by
+                    existing.updated_at = datetime.now(timezone.utc)
+                else:
+                    # 插入新记录
+                    session.add(StrategyDefaultParam(
+                        strategy_type=strategy_type,
+                        param_key=param_key,
+                        param_value=param_value,
+                        updated_by=updated_by
+                    ))
+                
+                # 记录变更历史
+                session.add(StrategyParamHistory(
+                    strategy_type=strategy_type,
+                    param_key=param_key,
+                    old_value=old_value,
+                    new_value=param_value,
+                    changed_by=updated_by,
+                    reason=f"通过 {updated_by} 更新"
+                ))
+                
+                await session.commit()
+                logger.info(f"已保存参数 {strategy_type}.{param_key}={param_value}，更新者: {updated_by}")
+        
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _save())
+                    future.result(timeout=5)  # 设置超时确保完成
+            else:
+                loop.run_until_complete(_save())
+        except Exception as e:
+            logger.warning(f"无法保存参数到数据库: {e}")
+    
+    except ImportError as e:
+        logger.warning(f"无法导入数据库模块进行保存: {e}")
+
+
+def _save_all_params_to_db(strategy_type: str, params: Dict[str, float], updated_by: str = "system") -> None:
+    """在单一事务中批量保存多个参数到数据库。"""
+    try:
+        from app.services.database import get_db
+        from app.models.db_models import StrategyDefaultParam, StrategyParamHistory
+        from sqlalchemy import select
+        
+        async def _save_all():
+            async with get_db() as session:
+                for param_key, param_value in params.items():
+                    # 查询是否已存在记录
+                    stmt = select(StrategyDefaultParam).where(
+                        StrategyDefaultParam.strategy_type == strategy_type,
+                        StrategyDefaultParam.param_key == param_key
+                    )
+                    result = await session.execute(stmt)
+                    existing = result.scalar_one_or_none()
+                    
+                    old_value = float(existing.param_value) if existing else None
+                    
+                    if existing:
+                        # 更新已有记录
+                        existing.param_value = param_value
+                        existing.updated_by = updated_by
+                        existing.updated_at = datetime.now(timezone.utc)
+                    else:
+                        # 插入新记录
+                        session.add(StrategyDefaultParam(
+                            strategy_type=strategy_type,
+                            param_key=param_key,
+                            param_value=param_value,
+                            updated_by=updated_by
+                        ))
+                    
+                    # 记录变更历史
+                    session.add(StrategyParamHistory(
+                        strategy_type=strategy_type,
+                        param_key=param_key,
+                        old_value=old_value,
+                        new_value=param_value,
+                        changed_by=updated_by,
+                        reason=f"通过 {updated_by} 更新"
+                    ))
+                
+                await session.commit()
+                logger.info(f"已为策略 {strategy_type} 保存 {len(params)} 个参数，更新者: {updated_by}")
+        
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _save_all())
+                    future.result(timeout=10)
+            else:
+                loop.run_until_complete(_save_all())
+        except Exception as e:
+            logger.warning(f"无法批量保存参数到数据库: {e}")
+    
+    except ImportError as e:
+        logger.warning(f"无法导入数据库模块进行批量保存: {e}")
+
+
+def _get_custom_default_params(strategy_type: str) -> Dict[str, float]:
+    """从数据库缓存中获取指定策略的自定义默认参数。"""
+    cache = _load_db_default_params()
+    return cache.get(strategy_type, {})
+
+
+def get_all_templates_meta(include_all: bool = False) -> List[Dict[str, Any]]:
+    """返回模板元数据列表（可安全 JSON 序列化，不含可调用对象）。
+    合并硬编码默认值与数据库存储的自定义默认值。
+    
+    Args:
+        include_all: 为 True 时返回所有策略（含异步策略）；
+                     为 False 时仅返回支持历史回放的策略。
+    """
+    # 加载数据库自定义参数
+    db_params = _load_db_default_params()
+    
     result = []
     for t in STRATEGY_TEMPLATES.values():
+        strategy_id = t["id"]
+        supports_replay = strategy_id not in ASYNC_STRATEGIES  # 是否支持历史回放
+        
+        # 不包含全部时，跳过异步策略
+        if not include_all and not supports_replay:
+            continue
+        
+        # 获取数据库中的自定义参数覆盖值
+        custom_params = db_params.get(strategy_id, {})
+        
+        # 合并参数：数据库值覆盖硬编码默认值
+        merged_params = []
+        for param in t["params"]:
+            param_copy = param.copy()
+            if param["key"] in custom_params:
+                param_copy["default"] = custom_params[param["key"]]
+                param_copy["is_custom"] = True  # 标记为已自定义
+            merged_params.append(param_copy)
+        
         result.append({
-            "id":          t["id"],
-            "name":        t["name"],
-            "description": t["description"],
-            "params":      t["params"],
+            "id":              strategy_id,
+            "name":            t["name"],
+            "description":     t["description"],
+            "params":          merged_params,
+            "supports_replay": supports_replay,
         })
     return result
 
 
+def get_template_default_params(strategy_type: str) -> Dict[str, float]:
+    """获取策略的当前默认参数（合并数据库自定义值与硬编码默认值）。"""
+    template = get_template(strategy_type)
+    custom = _get_custom_default_params(strategy_type)
+    
+    defaults = {}
+    for p in template["params"]:
+        key = p["key"]
+        # 优先使用数据库自定义值，否则使用硬编码默认值
+        defaults[key] = custom.get(key, p["default"])
+    return defaults
+
+
+def get_replay_templates() -> List[Dict[str, Any]]:
+    """仅返回支持历史回放的策略（排除异步策略）。"""
+    return get_all_templates_meta(include_all=False)
+
+
 def build_signal_func(strategy_type: str, params: Dict[str, Any]) -> Callable:
-    """Return a signal_func(df) -> pd.Series with params baked in."""
+    """返回一个已绑定参数的信号函数 signal_func(df) -> pd.Series。"""
     template = get_template(strategy_type)
     raw_func = template["signal_func"]
 
-    # Validate and cast params
+    # 校验并转换参数类型
     validated = {}
     for p in template["params"]:
         key = p["key"]
@@ -688,18 +1012,17 @@ def build_signal_func(strategy_type: str, params: Dict[str, Any]) -> Callable:
             val = int(val)
         elif p["type"] == "float":
             val = float(val)
-        # For 'str' type, keep as is
+        # str 类型保持原样
         validated[key] = val
 
     import inspect
     if inspect.iscoroutinefunction(raw_func):
+        # 异步策略：包装为异步信号函数
         async def signal_func_async(df: pd.DataFrame) -> pd.Series:
             return await raw_func(df, **validated)
         return signal_func_async
     else:
+        # 同步策略：包装为同步信号函数
         def signal_func_sync(df: pd.DataFrame) -> pd.Series:
             return raw_func(df, **validated)
         return signal_func_sync
-
-
-

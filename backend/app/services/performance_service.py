@@ -28,14 +28,24 @@ class PerformanceService:
         start_date: datetime,
         end_date: datetime,
         initial_capital: Decimal = Decimal("100000"),
+        session_id: Optional[str] = None,
     ) -> Dict:
-        """Calculate complete performance metrics for a given time range."""
+        """Calculate complete performance metrics for a given time range.
+
+        Args:
+            start_date: Start of the analysis period
+            end_date: End of the analysis period
+            initial_capital: Starting capital
+            session_id: Optional session ID to filter data (for historical replay)
+        """
 
         # 1. Get equity curve
-        equity_curve = await self._get_equity_curve(start_date, end_date)
+        equity_curve = await self._get_equity_curve(start_date, end_date, session_id)
 
         # 2. Get closed trade pairs with trades for TCA
-        closed_pairs_with_tca = await self._get_closed_pairs_with_tca(start_date, end_date)
+        closed_pairs_with_tca = await self._get_closed_pairs_with_tca(
+            start_date, end_date, session_id
+        )
 
         # 3. Calculate returns series
         returns = self._calculate_returns(equity_curve)
@@ -64,12 +74,14 @@ class PerformanceService:
         }
 
         # Win rate & profit factor
+        # Return None for ratio metrics when there's no trades (data insufficient)
         if metrics["total_trades"] > 0:
             metrics["win_rate"] = round(
                 metrics["winning_trades"] / metrics["total_trades"] * 100, 2
             )
         else:
-            metrics["win_rate"] = 0
+            # Explicitly set to None when no trades - don't use arbitrary value
+            metrics["win_rate"] = None
 
         total_profit = sum(p["pnl"] for p in winning)
         total_loss = abs(sum(p["pnl"] for p in losing))
@@ -79,141 +91,225 @@ class PerformanceService:
 
         if total_loss > 0:
             metrics["profit_factor"] = round(float(total_profit / total_loss), 2)
+        elif total_profit > 0:
+            # All winning trades, no losses - max theoretical profit factor
+            metrics["profit_factor"] = 99.99
         else:
-            # Avoid infinity for JSON compatibility
-            metrics["profit_factor"] = 99.99 if total_profit > 0 else 0.0
+            # No trades or no PnL data - return None instead of arbitrary value
+            metrics["profit_factor"] = None if metrics["total_trades"] == 0 else 0.0
 
-        metrics["avg_profit"] = round(
-            float(total_profit / len(winning)), 2
-        ) if winning else 0.0
-        metrics["avg_loss"] = round(
-            float(total_loss / len(losing)), 2
-        ) if losing else 0.0
+        metrics["avg_profit"] = (
+            round(float(total_profit / len(winning)), 2) if winning else 0.0
+        )
+        metrics["avg_loss"] = (
+            round(float(total_loss / len(losing)), 2) if losing else 0.0
+        )
 
         # Max drawdown
         max_dd, max_dd_pct = self._calculate_max_drawdown(equity_curve)
         metrics["max_drawdown"] = round(max_dd, 2)
         metrics["max_drawdown_pct"] = round(max_dd_pct, 2)
+        
+        # Max drawdown duration (days)
+        max_dd_duration = self._calculate_max_drawdown_duration(equity_curve)
+        metrics["max_drawdown_duration"] = max_dd_duration
 
         # TCA (Transaction Cost Analysis)
         tca_metrics = self._calculate_tca_metrics(closed_pairs_with_tca)
         metrics["tca"] = tca_metrics
 
-        # Volatility
+        # Volatility (daily standard deviation annualized)
         volatility = self._calculate_volatility(returns)
+        # 返回百分比形式（如 23.05 表示 23.05%），前端直接显示无需再×100
         metrics["volatility"] = round(float(volatility * 100), 2)
 
-        # Annualized return
-        days = max((end_date - start_date).days, 1)
-        years = days / 365
+        # Annualized return - use actual equity curve time span for accuracy
+        if equity_curve and len(equity_curve) >= 2:
+            first_ts = equity_curve[0]["timestamp"]
+            last_ts = equity_curve[-1]["timestamp"]
+            if first_ts and last_ts:
+                first_dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                actual_days = max((last_dt - first_dt).days, 1)
+            else:
+                actual_days = max((end_date - start_date).days, 1)
+        else:
+            actual_days = max((end_date - start_date).days, 1)
+
+        years = actual_days / 365
         if years > 0 and init_cap > 0:
-            annualized = (
-                ((final_equity / init_cap) ** (1 / years)) - 1
-            ) * 100
+            annualized = (((final_equity / init_cap) ** (1 / years)) - 1) * 100
         else:
             annualized = 0.0
         metrics["annualized_return"] = round(float(annualized), 2)
 
-        # Sharpe ratio
-        if volatility > 0:
-            metrics["sharpe_ratio"] = round(
-                float((annualized / 100 - self.RISK_FREE_RATE) / volatility), 2
-            )
+        # Sharpe ratio: (annualized_return% - risk_free_rate%) / annual_volatility%
+        # Note: volatility is already annualized (daily_std * sqrt(252))
+        # Return None if insufficient data (less than 5 data points or zero volatility)
+        if len(returns) < 5:
+            metrics["sharpe_ratio"] = None
+            metrics["sortino_ratio"] = None
+            metrics["calmar_ratio"] = None
+            metrics["var_95"] = None
+            metrics["var_99"] = None
         else:
-            metrics["sharpe_ratio"] = 0.0
+            if volatility > 0:
+                metrics["sharpe_ratio"] = round(
+                    float((annualized / 100 - self.RISK_FREE_RATE) / volatility), 2
+                )
+            else:
+                metrics["sharpe_ratio"] = None  # Undefined when volatility is zero
 
-        # Sortino ratio (downside volatility)
-        downside_returns = [r for r in returns if r < 0]
-        if downside_returns:
-            downside_vol = float(np.std(downside_returns) * np.sqrt(252))
-        else:
-            downside_vol = 0.0
+            # Sortino ratio: (annualized_return% - risk_free_rate%) / annual_downside_vol%
+            # Downside vol is annualized the same way as total volatility
+            downside_returns = [r for r in returns if r < 0]
+            if downside_returns and len(downside_returns) >= 3:
+                downside_vol = float(np.std(downside_returns) * np.sqrt(252))
+            else:
+                downside_vol = 0.0
 
-        if downside_vol > 0:
-            metrics["sortino_ratio"] = round(
-                float((annualized / 100 - self.RISK_FREE_RATE) / downside_vol), 2
-            )
-        else:
-            metrics["sortino_ratio"] = 0.0
+            if downside_vol > 0:
+                metrics["sortino_ratio"] = round(
+                    float((annualized / 100 - self.RISK_FREE_RATE) / downside_vol), 2
+                )
+            else:
+                metrics["sortino_ratio"] = None  # Undefined when no downside volatility
 
-        # Calmar ratio
-        if max_dd_pct > 0:
-            metrics["calmar_ratio"] = round(float(annualized / max_dd_pct), 2)
-        else:
-            metrics["calmar_ratio"] = 0.0
+            # Calmar ratio: annualized_return% / max_drawdown%
+            if max_dd_pct > 0:
+                metrics["calmar_ratio"] = round(float(annualized / max_dd_pct), 2)
+            else:
+                metrics["calmar_ratio"] = None  # Undefined when no drawdown
 
-        # VaR (Value at Risk)
-        metrics["var_95"] = round(float(self.calculate_var(returns, 0.95)), 2)
-        metrics["var_99"] = round(float(self.calculate_var(returns, 0.99)), 2)
+            # VaR (Value at Risk) - historical simulation
+            var_95 = self.calculate_var(returns, 0.95)
+            var_99 = self.calculate_var(returns, 0.99)
+            metrics["var_95"] = round(float(var_95), 2) if var_95 else None
+            metrics["var_99"] = round(float(var_99), 2) if var_99 else None
 
         # Holding time stats
         holding_hours = [
             p["holding_hours"] for p in closed_pairs_with_tca if p.get("holding_hours")
         ]
-        metrics["avg_holding_hours"] = round(
-            float(np.mean(holding_hours)), 2
-        ) if holding_hours else 0
+        metrics["avg_holding_hours"] = (
+            round(float(np.mean(holding_hours)), 2) if holding_hours else 0
+        )
 
         # Consecutive wins/losses
-        metrics["max_consecutive_wins"] = self._max_consecutive(closed_pairs_with_tca, True)
-        metrics["max_consecutive_losses"] = self._max_consecutive(closed_pairs_with_tca, False)
+        metrics["max_consecutive_wins"] = self._max_consecutive(
+            closed_pairs_with_tca, True
+        )
+        metrics["max_consecutive_losses"] = self._max_consecutive(
+            closed_pairs_with_tca, False
+        )
 
         # Period info
         metrics["start_date"] = start_date.isoformat()
         metrics["end_date"] = end_date.isoformat()
-        metrics["days"] = days
+        metrics["days"] = actual_days
+
+        # Validation: check if total_trades matches actual pairs count
+        actual_pairs_count = len(closed_pairs_with_tca)
+        if metrics["total_trades"] != actual_pairs_count:
+            logger.warning(
+                f"Session {session_id}: total_trades ({metrics['total_trades']}) "
+                f"!= actual pairs count ({actual_pairs_count})"
+            )
+        else:
+            logger.info(
+                f"Session {session_id}: metrics calculated - "
+                f"total_trades={metrics['total_trades']}, "
+                f"win_rate={metrics['win_rate']}, "
+                f"total_return={metrics['total_return']}%"
+            )
 
         return metrics
 
-    async def _get_closed_pairs_with_tca(self, start: datetime, end: datetime) -> List[Dict]:
-        """Fetch closed trade pairs and their corresponding trades for TCA calculation."""
+    async def _get_closed_pairs_with_tca(
+        self, start: datetime, end: datetime, session_id: Optional[str] = None
+    ) -> List[Dict]:
+        """Fetch closed trade pairs and their corresponding trades for TCA calculation.
+        
+        When session_id is provided, filters TradePair by joining with PaperTrade
+        and using PaperTrade.session_id (since TradePair doesn't have session_id column).
+        """
         async with get_db() as session:
             from sqlalchemy import select
-            
+
             closed_pairs = []
+
+            if session_id:
+                # Filter by session_id through join with PaperTrade
+                # Use entry_trade_id to join, as each TradePair must have an entry trade
+                stmt = (
+                    select(TradePair)
+                    .join(PaperTrade, TradePair.entry_trade_id == PaperTrade.id)
+                    .where(TradePair.status == "CLOSED")
+                    .where(TradePair.exit_time >= start)
+                    .where(TradePair.exit_time <= end)
+                    .where(PaperTrade.session_id == session_id)
+                )
+            else:
+                # Query global data (not associated with any replay session)
+                # Filter by PaperTrade.session_id IS NULL
+                stmt = (
+                    select(TradePair)
+                    .join(PaperTrade, TradePair.entry_trade_id == PaperTrade.id)
+                    .where(TradePair.status == "CLOSED")
+                    .where(TradePair.exit_time >= start)
+                    .where(TradePair.exit_time <= end)
+                    .where(PaperTrade.session_id.is_(None))
+                )
             
-            stmt = (
-                select(TradePair)
-                .where(TradePair.status == "CLOSED")
-                .where(TradePair.exit_time >= start)
-                .where(TradePair.exit_time <= end)
-                .order_by(TradePair.exit_time.asc())
-            )
+            stmt = stmt.order_by(TradePair.exit_time.asc())
             result = await session.execute(stmt)
             pairs_rows = result.scalars().all()
-            
+
+            # Log the number of closed pairs found for this session
+            logger.info(f"Session {session_id}: found {len(pairs_rows)} closed pairs")
+
             if not pairs_rows:
                 return []
-            
+
             for pair_row in pairs_rows:
                 entry_trade = None
                 exit_trade = None
-                
+
                 if pair_row.entry_trade_id:
-                    entry_stmt = select(PaperTrade).where(PaperTrade.id == pair_row.entry_trade_id)
+                    entry_stmt = select(PaperTrade).where(
+                        PaperTrade.id == pair_row.entry_trade_id
+                    )
                     entry_result = await session.execute(entry_stmt)
                     entry_trade = entry_result.scalar_one_or_none()
-                
+
                 if pair_row.exit_trade_id:
-                    exit_stmt = select(PaperTrade).where(PaperTrade.id == pair_row.exit_trade_id)
+                    exit_stmt = select(PaperTrade).where(
+                        PaperTrade.id == pair_row.exit_trade_id
+                    )
                     exit_result = await session.execute(exit_stmt)
                     exit_trade = exit_result.scalar_one_or_none()
-                
+
                 p_dict = {
                     "pair_id": pair_row.pair_id,
                     "symbol": pair_row.symbol,
                     "side": pair_row.side,
                     "pnl": float(pair_row.pnl) if pair_row.pnl else 0,
-                    "holding_hours": float(pair_row.holding_hours) if pair_row.holding_hours else 0,
+                    "holding_hours": float(pair_row.holding_hours)
+                    if pair_row.holding_hours
+                    else 0,
                     "entry_price": float(entry_trade.price) if entry_trade else 0,
-                    "entry_benchmark": float(entry_trade.benchmark_price) if entry_trade and entry_trade.benchmark_price else (float(entry_trade.price) if entry_trade else 0),
+                    "entry_benchmark": float(entry_trade.benchmark_price)
+                    if entry_trade and entry_trade.benchmark_price
+                    else (float(entry_trade.price) if entry_trade else 0),
                     "entry_side": entry_trade.side if entry_trade else None,
                     "exit_price": float(exit_trade.price) if exit_trade else 0,
-                    "exit_benchmark": float(exit_trade.benchmark_price) if exit_trade and exit_trade.benchmark_price else (float(exit_trade.price) if exit_trade else 0),
+                    "exit_benchmark": float(exit_trade.benchmark_price)
+                    if exit_trade and exit_trade.benchmark_price
+                    else (float(exit_trade.price) if exit_trade else 0),
                     "exit_side": exit_trade.side if exit_trade else None,
                 }
                 closed_pairs.append(p_dict)
-            
+
             return closed_pairs
 
     def _calculate_tca_metrics(self, pairs: List[Dict]) -> Dict:
@@ -223,7 +319,7 @@ class PerformanceService:
                 "avg_entry_slippage_bps": 0,
                 "avg_exit_slippage_bps": 0,
                 "total_slippage_cost": 0,
-                "execution_quality": "N/A"
+                "execution_quality": "N/A",
             }
 
         entry_slippages = []
@@ -235,18 +331,34 @@ class PerformanceService:
             # BUY: (fill - bench) / bench
             # SELL: (bench - fill) / bench
             if p["entry_side"] == "BUY":
-                s = (p["entry_price"] - p["entry_benchmark"]) / p["entry_benchmark"] if p["entry_benchmark"] > 0 else 0
+                s = (
+                    (p["entry_price"] - p["entry_benchmark"]) / p["entry_benchmark"]
+                    if p["entry_benchmark"] > 0
+                    else 0
+                )
             else:
-                s = (p["entry_benchmark"] - p["entry_price"]) / p["entry_benchmark"] if p["entry_benchmark"] > 0 else 0
+                s = (
+                    (p["entry_benchmark"] - p["entry_price"]) / p["entry_benchmark"]
+                    if p["entry_benchmark"] > 0
+                    else 0
+                )
             entry_slippages.append(s)
-            total_cost += s * p["entry_benchmark"] # Approximation of dollar cost
+            total_cost += s * p["entry_benchmark"]  # Approximation of dollar cost
 
             # Exit Slippage
             if p["exit_side"]:
                 if p["exit_side"] == "BUY":
-                    s = (p["exit_price"] - p["exit_benchmark"]) / p["exit_benchmark"] if p["exit_benchmark"] > 0 else 0
+                    s = (
+                        (p["exit_price"] - p["exit_benchmark"]) / p["exit_benchmark"]
+                        if p["exit_benchmark"] > 0
+                        else 0
+                    )
                 else:
-                    s = (p["exit_benchmark"] - p["exit_price"]) / p["exit_benchmark"] if p["exit_benchmark"] > 0 else 0
+                    s = (
+                        (p["exit_benchmark"] - p["exit_price"]) / p["exit_benchmark"]
+                        if p["exit_benchmark"] > 0
+                        else 0
+                    )
                 exit_slippages.append(s)
                 total_cost += s * p["exit_benchmark"]
 
@@ -261,7 +373,9 @@ class PerformanceService:
         }
 
         # Quality rating
-        total_avg_bps = (metrics["avg_entry_slippage_bps"] + metrics["avg_exit_slippage_bps"]) / 2
+        total_avg_bps = (
+            metrics["avg_entry_slippage_bps"] + metrics["avg_exit_slippage_bps"]
+        ) / 2
         if total_avg_bps < 5:
             metrics["execution_quality"] = "Excellent"
         elif total_avg_bps < 15:
@@ -274,17 +388,28 @@ class PerformanceService:
         return metrics
 
     async def _get_equity_curve(
-        self, start: datetime, end: datetime
+        self, start: datetime, end: datetime, session_id: Optional[str] = None
     ) -> List[Dict]:
-        """Fetch equity snapshots within range."""
+        """Fetch equity snapshots within range, optionally filtered by session_id.
+        
+        When session_id is provided, returns data for that specific session.
+        When session_id is None, returns global data (session_id IS NULL).
+        """
         async with get_db() as session:
-            result = await session.execute(
-                select(EquitySnapshot)
-                .where(EquitySnapshot.timestamp >= start)
-                .where(EquitySnapshot.timestamp <= end)
-                .order_by(EquitySnapshot.timestamp.asc())
+            query = select(EquitySnapshot).where(
+                EquitySnapshot.timestamp >= start, EquitySnapshot.timestamp <= end
             )
+            if session_id:
+                query = query.where(EquitySnapshot.session_id == session_id)
+            else:
+                # Query global data (not associated with any replay session)
+                query = query.where(EquitySnapshot.session_id.is_(None))
+            query = query.order_by(EquitySnapshot.timestamp.asc())
+            result = await session.execute(query)
             snapshots = result.scalars().all()
+
+        # Log the number of equity snapshots found
+        logger.info(f"Session {session_id}: found {len(snapshots)} equity snapshots")
 
         return [
             {
@@ -336,6 +461,63 @@ class PerformanceService:
 
         return max_dd, max_dd_pct
 
+    def _calculate_max_drawdown_duration(self, equity_curve: List[Dict]) -> Optional[int]:
+        """Calculate maximum drawdown duration in days.
+        
+        Returns the longest period (in days) that the portfolio was in a drawdown state,
+        i.e., below its previous peak.
+        
+        Returns:
+            Number of days of the longest drawdown period, or None if insufficient data.
+        """
+        if len(equity_curve) < 2:
+            return None
+
+        peak = equity_curve[0]["total_equity"]
+        peak_idx = 0
+        max_duration_days = 0
+        current_dd_start_idx = None
+
+        for i, point in enumerate(equity_curve):
+            equity = point["total_equity"]
+            
+            if equity >= peak:
+                # New peak reached, end of drawdown period
+                if current_dd_start_idx is not None:
+                    # Calculate duration of this drawdown period
+                    try:
+                        start_ts = equity_curve[current_dd_start_idx]["timestamp"]
+                        end_ts = point["timestamp"]
+                        if start_ts and end_ts:
+                            start_dt = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+                            duration_days = (end_dt - start_dt).days
+                            max_duration_days = max(max_duration_days, duration_days)
+                    except (ValueError, TypeError):
+                        pass
+                peak = equity
+                peak_idx = i
+                current_dd_start_idx = None
+            else:
+                # In drawdown state
+                if current_dd_start_idx is None:
+                    current_dd_start_idx = peak_idx
+
+        # If still in drawdown at the end, count it too
+        if current_dd_start_idx is not None and len(equity_curve) > 1:
+            try:
+                start_ts = equity_curve[current_dd_start_idx]["timestamp"]
+                end_ts = equity_curve[-1]["timestamp"]
+                if start_ts and end_ts:
+                    start_dt = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+                    end_dt = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+                    duration_days = (end_dt - start_dt).days
+                    max_duration_days = max(max_duration_days, duration_days)
+            except (ValueError, TypeError):
+                pass
+
+        return max_duration_days if max_duration_days > 0 else None
+
     def _calculate_volatility(self, returns: List[float]) -> float:
         """Calculate annualized volatility."""
         if not returns:
@@ -360,7 +542,9 @@ class PerformanceService:
 
         return max_streak
 
-    async def get_attribution(self, start_date: datetime, end_date: datetime) -> List[Dict]:
+    async def get_attribution(
+        self, start_date: datetime, end_date: datetime
+    ) -> List[Dict]:
         """Calculate profit attribution by strategy_id."""
         async with get_db() as session:
             stmt = (
@@ -368,7 +552,7 @@ class PerformanceService:
                     TradePair.strategy_id,
                     sqlfunc.sum(TradePair.pnl).label("total_pnl"),
                     sqlfunc.count(TradePair.id).label("trade_count"),
-                    sqlfunc.avg(TradePair.pnl_pct).label("avg_pnl_pct")
+                    sqlfunc.avg(TradePair.pnl_pct).label("avg_pnl_pct"),
                 )
                 .where(TradePair.status == "CLOSED")
                 .where(TradePair.exit_time >= start_date)
@@ -377,33 +561,78 @@ class PerformanceService:
             )
             result = await session.execute(stmt)
             rows = result.all()
-            
+
             attribution = []
             for row in rows:
-                attribution.append({
-                    "strategy_id": row.strategy_id or "manual",
-                    "total_pnl": float(row.total_pnl) if row.total_pnl else 0,
-                    "trade_count": row.trade_count,
-                    "avg_pnl_pct": float(row.avg_pnl_pct) if row.avg_pnl_pct else 0
-                })
+                attribution.append(
+                    {
+                        "strategy_id": row.strategy_id or "manual",
+                        "total_pnl": float(row.total_pnl) if row.total_pnl else 0,
+                        "trade_count": row.trade_count,
+                        "avg_pnl_pct": float(row.avg_pnl_pct) if row.avg_pnl_pct else 0,
+                    }
+                )
             return attribution
 
-    def calculate_var(self, returns: List[float], confidence_level: float = 0.95) -> float:
+    def calculate_var(
+        self, returns: List[float], confidence_level: float = 0.95
+    ) -> Optional[float]:
         """
         Calculate historical VaR (Value at Risk).
-        returns: daily returns series
-        confidence_level: e.g., 0.95 for 95% VaR
+        
+        Args:
+            returns: daily returns series
+            confidence_level: e.g., 0.95 for 95% VaR
+            
+        Returns:
+            VaR percentage or None if insufficient data
         """
         if len(returns) < 20:
-            return 0.0
-        
+            return None  # Insufficient data for reliable VaR calculation
+
         sorted_returns = sorted(returns)
         var_index = int((1 - confidence_level) * len(sorted_returns))
-        
+
         if var_index >= len(sorted_returns):
-            return 0.0
-        
+            return None
+
         return -sorted_returns[var_index] * 100
+
+    async def calculate_replay_metrics(self, session_id: str) -> Dict:
+        """
+        Calculate complete performance metrics for a historical replay session.
+        This mirrors the full metrics schema of BacktestResult.metrics.
+
+        Args:
+            session_id: The replay session ID to compute metrics for.
+
+        Returns:
+            A complete metrics dict matching BacktestResult.metrics schema.
+        """
+        from app.models.db_models import ReplaySession
+        from sqlalchemy import select
+
+        async with get_db() as session:
+            stmt = select(ReplaySession).where(ReplaySession.replay_session_id == session_id)
+            result = await session.execute(stmt)
+            replay = result.scalar_one_or_none()
+
+            if not replay:
+                return {}
+
+            start_time = replay.start_time or datetime(2024, 1, 1)
+            end_time = replay.end_time or datetime.now()
+            initial_capital = float(replay.initial_capital) if replay.initial_capital else 100000.0
+
+        # Use the existing calculate_metrics with session_id filter
+        metrics = await self.calculate_metrics(
+            start_date=start_time,
+            end_date=end_time,
+            initial_capital=initial_capital,
+            session_id=session_id,
+        )
+
+        return metrics
 
     def calculate_concentration(self, position_values: List[float]) -> float:
         """
@@ -412,7 +641,7 @@ class PerformanceService:
         """
         if not position_values or sum(position_values) == 0:
             return 0.0
-        
+
         total = sum(position_values)
         weights = [(v / total) ** 2 for v in position_values if v > 0]
         return sum(weights) * 10000

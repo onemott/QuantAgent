@@ -12,7 +12,9 @@ services:
       - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-scripts:/docker-entrypoint-initdb.d
+      # NOTE: init-scripts removed — schema is managed by Alembic migrations.
+      # Existing databases: run 'python scripts/run_migrations.py stamp 001' to transition.
+      # Fresh databases: Alembic creates all tables on first backend startup.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U quantagent"]
       interval: 10s
@@ -149,7 +151,7 @@ services:
     ports:
       - "3002:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_API_URL=
       - NEXT_PUBLIC_WS_URL=ws://localhost:8002/ws/market
     volumes:
       - ./frontend/my-app:/app

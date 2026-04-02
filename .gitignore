@@ -1,14 +1,12 @@
-# Environment variables
+# ── Secrets & Environment ─────────────────────────────────────────────────────
 .env
 .env.local
 .env.production
-
-# Secrets
 Private_key.pem
 *.pem
 *.key
 
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -17,30 +15,62 @@ __pycache__/
 venv/
 env/
 .venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
 
-# Node
+# ── Node / Next.js ────────────────────────────────────────────────────────────
 node_modules/
 npm-debug.log*
 yarn-error.log
+.next/
+.package.json.md5
 
-# IDE
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+build/
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
+.claude/
+.qoder/
+.workbuddy/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Logs
+# ── Logs & Temp ───────────────────────────────────────────────────────────────
 *.log
-
-# Build outputs
-dist/
-build/
-*.egg-info/
-
-# Temporary files
 nul
 *.tmp
+
+# ── Compiled binaries ─────────────────────────────────────────────────────────
+gateway/main.exe
+
+# ── Docs & specs (not needed for running the project) ─────────────────────────
+docs/
+specs实施方案/
+*.txt
+
+# ── One-off scripts & debug files ─────────────────────────────────────────────
+scripts/
+backend/scripts/
+tests/
+backend/tests/
+test_*.py
+verify_*.py
+
+# ── Misc project-local files ──────────────────────────────────────────────────
+review_*.txt
+工程功能评估报告.md
+技术债务记录*.txt
+智能体Skill系统使用指南.md
+界面功能复查与协调.txt
+Skill*.txt
+prompt认知.txt
+完整调研*.txt
+调研*.txt
+策略组合功能实现文档.md
+backend/backend/

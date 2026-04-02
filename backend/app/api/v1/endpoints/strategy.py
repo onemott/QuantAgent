@@ -14,8 +14,9 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from app.services.strategy_templates import get_all_templates_meta, build_signal_func, get_template
+from app.services.strategy_templates import get_all_templates_meta, build_signal_func, get_template, update_template_default_params, get_template_default_params
 from app.services.binance_service import binance_service
+from app.services.clickhouse_service import clickhouse_service
 from app.services.database import get_db
 from app.models.db_models import BacktestResult, OptimizationResult
 from app.services.backtester import GridOptimizer, OptunaOptimizer
@@ -35,6 +36,8 @@ class BacktestRequest(BaseModel):
     limit:           int = 500       # number of candles to fetch
     initial_capital: float = 10000.0
     params:          Dict[str, Any] = {}
+    start_time:      Optional[datetime] = None  # 按时间范围查询（ClickHouse）
+    end_time:        Optional[datetime] = None  # 按时间范围查询（ClickHouse）
 
 
 class TradeRecord(BaseModel):
@@ -87,8 +90,63 @@ class BacktestResponse(BaseModel):
 
 @router.get("/templates")
 async def get_templates():
-    """Return all available strategy templates with parameter definitions."""
+    """Return all available strategy templates with parameter definitions.
+    Includes custom default params loaded from database."""
     return {"templates": get_all_templates_meta()}
+
+
+class UpdateTemplateParamsRequest(BaseModel):
+    params: Dict[str, Any]  # { "fast_period": 15, "slow_period": 45 }
+    updated_by: str = "optimization"  # Who updated: optimization, manual_backtest, manual_replay
+
+
+@router.put("/templates/{strategy_type}/params")
+async def update_template_params(
+    strategy_type: str,
+    req: UpdateTemplateParamsRequest,
+):
+    """
+    Update the default parameter values for a strategy template.
+    This is typically used after running parameter optimization to save
+    the best found parameters as the new defaults.
+    
+    Saves params to database for persistence across restarts.
+    
+    Returns the updated template definition.
+    """
+    try:
+        updated_template = update_template_default_params(
+            strategy_type, 
+            req.params,
+            updated_by=req.updated_by
+        )
+        return {
+            "success": True,
+            "message": f"策略 '{strategy_type}' 的预设参数已更新",
+            "template": {
+                "id": updated_template["id"],
+                "name": updated_template["name"],
+                "params": updated_template["params"],
+            },
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/templates/{strategy_type}/default-params")
+async def get_strategy_default_params(strategy_type: str):
+    """
+    Get the current default params for a specific strategy.
+    Returns merged params from database + hardcoded defaults.
+    """
+    try:
+        params = get_template_default_params(strategy_type)
+        return {
+            "strategy_type": strategy_type,
+            "params": params
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,13 +175,56 @@ async def run_backtest(req: BacktestRequest):
 
     # Normalize symbol to ccxt format
     symbol_ccxt = _normalize_symbol(req.symbol)
-    symbol_clean = req.symbol.upper()
+    symbol_clean = req.symbol.upper()  # ClickHouse uses "BTCUSDT" format
 
-    # Fetch historical OHLCV from Binance
-    try:
-        df = await binance_service.get_klines_dataframe(symbol_ccxt, req.interval, limit=effective_limit)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to fetch market data: {e}")
+    # Fetch historical OHLCV data
+    df = None
+    use_time_range = req.start_time is not None and req.end_time is not None
+
+    if use_time_range:
+        # 按时间范围查询（优先使用 ClickHouse 历史数据）
+        logger.info(f"Backtest with time range: {req.start_time} ~ {req.end_time}")
+        try:
+            df = await clickhouse_service.get_klines_dataframe(
+                symbol=symbol_clean,
+                interval=req.interval,
+                start=req.start_time,
+                end=req.end_time,
+                limit=10000,  # 时间范围查询允许更多数据
+            )
+            if df is not None and len(df) >= 50:
+                logger.info(f"ClickHouse returned {len(df)} bars for {symbol_clean}/{req.interval}")
+            else:
+                logger.warning(f"ClickHouse data insufficient ({len(df) if df is not None else 0} bars), falling back to Binance")
+                df = None
+        except Exception as e:
+            logger.warning(f"ClickHouse query failed: {e}, falling back to Binance")
+            df = None
+
+        # 如果 ClickHouse 数据不足，回退到 Binance（但 Binance 不支持时间范围，只能用 limit）
+        if df is None:
+            try:
+                df = await binance_service.get_klines_dataframe(symbol_ccxt, req.interval, limit=effective_limit)
+                if df is not None and len(df) >= 50:
+                    logger.warning(
+                        f"Time range query fell back to Binance (limit={effective_limit}). "
+                        f"Consider backfilling ClickHouse data for {symbol_clean}/{req.interval}"
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"指定时间范围内数据不足，请确保 ClickHouse 中有 {symbol_clean}/{req.interval} 的历史数据"
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Failed to fetch market data: {e}")
+    else:
+        # 向后兼容：使用 limit 参数从 Binance 获取数据
+        try:
+            df = await binance_service.get_klines_dataframe(symbol_ccxt, req.interval, limit=effective_limit)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to fetch market data: {e}")
 
     if df is None or len(df) < 50:
         raise HTTPException(status_code=400, detail="Not enough candle data to run backtest (need ≥50)")
@@ -296,6 +397,30 @@ async def get_backtest_history(
             "created_at":     row.created_at.isoformat() if row.created_at else None,
         })
     return {"history": history, "total": len(history)}
+
+
+@router.delete("/backtest/history/{record_id}")
+async def delete_backtest_record(record_id: int):
+    """
+    Delete a specific backtest record by ID.
+    Returns success confirmation.
+    """
+    from sqlalchemy import delete, select
+    async with get_db() as session:
+        # Check if record exists
+        stmt = select(BacktestResult).where(BacktestResult.id == record_id)
+        result = await session.execute(stmt)
+        record = result.scalar_one_or_none()
+        
+        if not record:
+            raise HTTPException(status_code=404, detail="回测记录不存在")
+        
+        # Delete the record
+        delete_stmt = delete(BacktestResult).where(BacktestResult.id == record_id)
+        await session.execute(delete_stmt)
+        await session.commit()
+    
+    return {"success": True, "message": "回测记录已删除", "id": record_id}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

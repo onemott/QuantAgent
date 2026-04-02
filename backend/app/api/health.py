@@ -6,19 +6,18 @@ import time
 import asyncio
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
-@router.get("/health")
+@router.get("/health", tags=["系统监控"], summary="健康检查", description="检查系统各组件状态，包括数据库、Redis、ClickHouse和摄入服务")
 async def health_check():
     """
-    System Health Check Endpoint.
-    Checks connectivity to critical dependencies: PostgreSQL, Redis, ClickHouse, Ingestion Service.
+    系统健康检查端点。
+    检查关键依赖项的连接状态：PostgreSQL、Redis、ClickHouse、数据摄入服务。
     """
-    # 1. PostgreSQL Check
+    # 1. PostgreSQL 检查
     db_ok = await check_db_connection()
     
-    # 2. Redis Check & Latency
+    # 2. Redis 检查与延迟
     redis_ok = False
     redis_latency_ms = -1
     try:
@@ -31,7 +30,7 @@ async def health_check():
     except Exception:
         pass
 
-    # 3. Ingestion Service Status
+    # 3. 数据摄入服务状态
     ingestion_status = "unknown"
     ingestion_mode = "unknown"
     try:
@@ -51,7 +50,7 @@ async def health_check():
     except ImportError:
         pass
 
-    # 4. WebSocket Connections Count
+    # 4. WebSocket 连接数
     ws_count = 0
     try:
         from app.core.websocket_manager import ws_manager
@@ -59,7 +58,7 @@ async def health_check():
     except ImportError:
         pass
 
-    # 5. ClickHouse Check
+    # 5. ClickHouse 检查
     clickhouse_ok = False
     try:
         from app.services.clickhouse_service import clickhouse_service
@@ -70,7 +69,7 @@ async def health_check():
     except Exception:
         pass
 
-    # Overall Status
+    # 总体状态
     status = "healthy"
     if not db_ok or not redis_ok:
         status = "unhealthy"

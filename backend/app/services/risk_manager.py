@@ -338,6 +338,171 @@ class RiskManager:
 
         return RiskCheckResult(allowed=True)
 
+    # ── Historical-data-aware risk check (for replay mode) ──────────────────────
+    async def check_order_with_historical_data(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        current_balance: float,
+        current_positions: Dict[str, float],
+        total_portfolio_value: float,
+        market_price: float,
+        leverage: int = 1,
+        historical_volatility: Optional[float] = None,
+        historical_macro_risk: Optional[bool] = None,
+        simulated_time: Optional[datetime] = None,
+    ) -> RiskCheckResult:
+        """
+        Risk check using historical data instead of real-time market data.
+        Used by historical replay to maintain time-consistency.
+
+        Key differences from check_order():
+        - Volatility check uses pre-loaded historical_volatility (not live API)
+        - Macro risk uses pre-loaded historical_macro_risk (not live API)
+        - Daily PnL uses simulated_time for intra-day calculations
+
+        Args:
+            historical_volatility: Annualized historical volatility (0.0-1.0).
+                                  If None, volatility spike check is skipped.
+            historical_macro_risk: True if macro risk was elevated at simulated_time.
+                                  If None, macro check is skipped.
+            simulated_time: The replay's simulated timestamp for intra-day logic.
+        """
+        config = await self.get_config()
+
+        quantity_dec = Decimal(str(quantity))
+        price_dec = Decimal(str(price))
+        order_value = quantity_dec * price_dec
+
+        # Determine if this is an opening/increasing position
+        current_pos_qty = Decimal(str(current_positions.get(symbol, 0)))
+        is_opening = False
+        if side == "BUY" and current_pos_qty >= 0:
+            is_opening = True
+            new_qty = current_pos_qty + quantity_dec
+        elif side == "SELL" and current_pos_qty <= 0:
+            is_opening = True
+            new_qty = current_pos_qty - quantity_dec
+        else:
+            new_qty = current_pos_qty
+
+        # Rule 0: Global Kill Switch (always real-time check — intentional)
+        kill_switch = await redis_get(REDIS_KILL_SWITCH_KEY)
+        if kill_switch:
+            return RiskCheckResult(allowed=False, rule="KILL_SWITCH",
+                                   reason="Global Kill Switch Activated")
+
+        # Rule 0.1: Volatility spike — use HISTORICAL volatility, skip live API
+        if is_opening and historical_volatility is not None:
+            max_vol = config.get("MAX_VOLATILITY_THRESHOLD", 0.80)
+            if historical_volatility > max_vol:
+                reason = (
+                    f"Historical volatility spike: {symbol} at {historical_volatility:.2%} "
+                    f"(threshold {max_vol:.0%}) — new positions blocked"
+                )
+                await self._log_risk_event(symbol, "TAIL_RISK_HALT", True, {
+                    "volatility": historical_volatility,
+                    "source": "historical",
+                    "simulated_time": simulated_time.isoformat() if simulated_time else None,
+                })
+                return RiskCheckResult(allowed=False, rule="VOLATILITY_SPIKE", reason=reason)
+
+        # Rule 0.2: Macro risk — use HISTORICAL signal, skip live API
+        if is_opening and historical_macro_risk is True:
+            reason = (
+                f"Historical macro risk signal: position blocked at simulated time "
+                f"{simulated_time.isoformat() if simulated_time else 'unknown'}"
+            )
+            await self._log_risk_event(symbol, "MACRO_RISK_HALT", True, {
+                "source": "historical",
+                "simulated_time": simulated_time.isoformat() if simulated_time else None,
+            })
+            return RiskCheckResult(allowed=False, rule="MACRO_RISK_HALT", reason=reason)
+
+        # Rule 0.5: Fat Finger check (non-time-sensitive, keep as-is)
+        if market_price and market_price > 0:
+            deviation = abs(price - market_price) / market_price
+            price_dev_limit = config.get("PRICE_DEVIATION_PCT", 0.05)
+            if deviation > price_dev_limit:
+                return RiskCheckResult(
+                    allowed=False, rule="FAT_FINGER",
+                    reason=f"Price deviation {deviation*100:.2f}% exceeds {price_dev_limit*100:.0f}%"
+                )
+
+        # Rule 1: Single position limit
+        if is_opening:
+            new_pos_value = abs(new_qty) * price_dec
+            single_pos_limit = config.get("MAX_SINGLE_POSITION_PCT", 0.20)
+            max_allowed = Decimal(str(total_portfolio_value)) * Decimal(str(single_pos_limit))
+            if new_pos_value > max_allowed:
+                return RiskCheckResult(
+                    allowed=False, rule="MAX_SINGLE_POSITION",
+                    reason=f"Position size ${float(new_pos_value):.2f} exceeds {single_pos_limit*100:.0f}% limit"
+                )
+
+        # Rule 2: Total drawdown circuit breaker
+        if is_opening:
+            peak = await self._get_peak_balance(total_portfolio_value)
+            if peak > 0:
+                drawdown = (peak - total_portfolio_value) / peak
+                drawdown_limit = config.get("MAX_TOTAL_DRAWDOWN_PCT", 0.15)
+                if drawdown >= drawdown_limit:
+                    return RiskCheckResult(
+                        allowed=False, rule="DRAWDOWN_HALT",
+                        reason=f"Drawdown {drawdown*100:.2f}% exceeds {drawdown_limit*100:.0f}% limit"
+                    )
+
+        # Rule 3: Daily loss — use simulated_time for intra-day calculation
+        if is_opening and simulated_time:
+            # Calculate today's loss based on simulated date
+            today_date = simulated_time.date()
+            daily_pnl = await self._get_today_realized_pnl_simulated(simulated_time)
+            if daily_pnl < 0:
+                daily_loss_pct = abs(daily_pnl) / float(INITIAL_BALANCE)
+                daily_loss_limit = config.get("MAX_DAILY_LOSS_PCT", 0.05)
+                if daily_loss_pct >= daily_loss_limit:
+                    return RiskCheckResult(
+                        allowed=False, rule="DAILY_LOSS_HALT",
+                        reason=f"Daily loss {daily_loss_pct*100:.2f}% exceeds {daily_loss_limit*100:.0f}% limit"
+                    )
+
+        # Rule 4: Balance sufficiency
+        if is_opening:
+            margin_required = order_value / Decimal(leverage)
+            fee = order_value * FEE_RATE
+            total_cost = margin_required + fee
+            if Decimal(str(current_balance)) < total_cost:
+                return RiskCheckResult(
+                    allowed=False, rule="INSUFFICIENT_BALANCE",
+                    reason=f"Balance ${current_balance:.2f} < required ${float(total_cost):.2f}"
+                )
+
+        return RiskCheckResult(allowed=True)
+
+    async def _get_today_realized_pnl_simulated(
+        self, simulated_time: datetime
+    ) -> float:
+        """Get realized PnL for the simulated date (replay mode)."""
+        from app.services.database import get_db
+        from app.models.db_models import PaperTrade
+        from sqlalchemy import select, func as sqlfunc
+        from datetime import datetime, timedelta
+
+        day_start = simulated_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+
+        async with get_db() as session:
+            result = await session.execute(
+                select(sqlfunc.coalesce(sqlfunc.sum(PaperTrade.pnl), 0))
+                .where(PaperTrade.created_at >= day_start)
+                .where(PaperTrade.created_at < day_end)
+                .where(PaperTrade.pnl.isnot(None))
+            )
+            val = result.scalar()
+            return float(val) if val else 0.0
+
     def _calculate_dynamic_leverage(self, portfolio_value: float) -> int:
         """
         Tiered Margin Logic:

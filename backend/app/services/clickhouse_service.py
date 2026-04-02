@@ -43,7 +43,9 @@ SETTINGS index_granularity = 8192
 """
 
 # ── Client singleton ──────────────────────────────────────────────────────────
+import threading
 _client = None
+_client_lock = threading.Lock()
 
 
 def _ch_connect(database: str, **extra):
@@ -159,33 +161,34 @@ class ClickHouseService:
         client = _get_client()
         if client is None or not rows:
             return 0
-        try:
-            data = [
-                [
-                    symbol,
-                    interval,
-                    r["open_time"],
-                    float(r["open"]),
-                    float(r["high"]),
-                    float(r["low"]),
-                    float(r["close"]),
-                    float(r["volume"]),
-                    r["close_time"],
+        with _client_lock:
+            try:
+                data = [
+                    [
+                        symbol,
+                        interval,
+                        r["open_time"],
+                        float(r["open"]),
+                        float(r["high"]),
+                        float(r["low"]),
+                        float(r["close"]),
+                        float(r["volume"]),
+                        r["close_time"],
+                    ]
+                    for r in rows
                 ]
-                for r in rows
-            ]
-            client.insert(
-                "klines",
-                data,
-                column_names=[
-                    "symbol", "interval", "open_time",
-                    "open", "high", "low", "close", "volume", "close_time",
-                ],
-            )
-            return len(data)
-        except Exception as e:
-            logger.warning(f"ClickHouse insert failed ({symbol}/{interval}): {e}")
-            return 0
+                client.insert(
+                    "klines",
+                    data,
+                    column_names=[
+                        "symbol", "interval", "open_time",
+                        "open", "high", "low", "close", "volume", "close_time",
+                    ],
+                )
+                return len(data)
+            except Exception as e:
+                logger.warning(f"ClickHouse insert failed ({symbol}/{interval}): {e}")
+                return 0
 
     async def insert_klines(
         self,
@@ -208,6 +211,7 @@ class ClickHouseService:
         start: Optional[datetime] = None,
         end: Optional[datetime]   = None,
         limit: int = 1000,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Query K-lines from ClickHouse.
@@ -218,40 +222,42 @@ class ClickHouseService:
         client = _get_client()
         if client is None:
             return []
-        try:
-            conditions = [
-                f"symbol = '{symbol}'",
-                f"interval = '{interval}'",
-            ]
-            if start:
-                conditions.append(f"open_time >= '{start.strftime('%Y-%m-%d %H:%M:%S')}'")
-            if end:
-                conditions.append(f"open_time <= '{end.strftime('%Y-%m-%d %H:%M:%S')}'")
+        with _client_lock:
+            try:
+                conditions = [
+                    f"symbol = '{symbol}'",
+                    f"interval = '{interval}'",
+                ]
+                if start:
+                    conditions.append(f"open_time >= '{start.strftime('%Y-%m-%d %H:%M:%S')}'")
+                if end:
+                    conditions.append(f"open_time <= '{end.strftime('%Y-%m-%d %H:%M:%S')}'")
 
-            where = " AND ".join(conditions)
-            sql   = f"""
-                SELECT open_time, open, high, low, close, volume, close_time
-                FROM klines
-                WHERE {where}
-                ORDER BY open_time ASC
-                LIMIT {limit}
-            """
-            result = client.query(sql)
-            rows = []
-            for row in result.result_rows:
-                rows.append({
-                    "open_time":  row[0],
-                    "open":       row[1],
-                    "high":       row[2],
-                    "low":        row[3],
-                    "close":      row[4],
-                    "volume":     row[5],
-                    "close_time": row[6],
-                })
-            return rows
-        except Exception as e:
-            logger.warning(f"ClickHouse query failed ({symbol}/{interval}): {e}")
-            return []
+                where = " AND ".join(conditions)
+                sql   = f"""
+                    SELECT open_time, open, high, low, close, volume, close_time
+                    FROM klines
+                    WHERE {where}
+                    ORDER BY open_time ASC
+                    LIMIT {limit}
+                    OFFSET {offset}
+                """
+                result = client.query(sql)
+                rows = []
+                for row in result.result_rows:
+                    rows.append({
+                        "open_time":  row[0],
+                        "open":       row[1],
+                        "high":       row[2],
+                        "low":        row[3],
+                        "close":      row[4],
+                        "volume":     row[5],
+                        "close_time": row[6],
+                    })
+                return rows
+            except Exception as e:
+                logger.warning(f"ClickHouse query failed ({symbol}/{interval}): {e}")
+                return []
 
     async def query_klines(
         self,
@@ -260,12 +266,13 @@ class ClickHouseService:
         start: Optional[datetime] = None,
         end: Optional[datetime]   = None,
         limit: int = 1000,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Async wrapper for query_klines_sync."""
         import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, self.query_klines_sync, symbol, interval, start, end, limit
+            None, self.query_klines_sync, symbol, interval, start, end, limit, offset
         )
 
     # ── DataFrame interface (for backtest engine) ─────────────────────────────
@@ -282,7 +289,7 @@ class ClickHouseService:
         Returns None if ClickHouse is unavailable or has insufficient data.
         """
         rows = await self.query_klines(symbol, interval, start, end, limit)
-        if len(rows) < 50:
+        if len(rows) < 2:
             return None
         df = pd.DataFrame(rows)
         df["open_time"] = pd.to_datetime(df["open_time"])
@@ -301,7 +308,8 @@ class ClickHouseService:
             if client is None:
                 return False
             try:
-                client.command("SELECT 1")
+                with _client_lock:
+                    client.command("SELECT 1")
                 return True
             except Exception:
                 return False
@@ -317,47 +325,234 @@ class ClickHouseService:
             if client is None:
                 return 0
             try:
-                result = client.query(
-                    f"SELECT count() FROM klines WHERE symbol='{symbol}' AND interval='{interval}'"
-                )
+                with _client_lock:
+                    result = client.query(
+                        f"SELECT count() FROM klines WHERE symbol='{symbol}' AND interval='{interval}'"
+                    )
                 return int(result.result_rows[0][0])
             except Exception:
                 return 0
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _count)
 
+    async def get_bar_count(
+        self,
+        symbol: str,
+        interval: str,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> int:
+        """Return the number of K-line bars in a specific time range."""
+        import asyncio
+        def _count():
+            client = _get_client()
+            if client is None:
+                return 0
+            try:
+                with _client_lock:
+                    conditions = [
+                        f"symbol='{symbol}'",
+                        f"interval='{interval}'",
+                    ]
+                    if start_time:
+                        conditions.append(f"open_time >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'")
+                    if end_time:
+                        conditions.append(f"open_time <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'")
+                    
+                    cond_str = " AND ".join(conditions)
+                    result = client.query(f"SELECT count() FROM klines WHERE {cond_str}")
+                    return int(result.result_rows[0][0])
+            except Exception as e:
+                logger.warning(f"get_bar_count failed ({symbol}/{interval}): {e}")
+                return 0
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _count)
+
     # ── Get date range ────────────────────────────────────────────────────────
-    async def get_valid_date_range(self, symbol: str) -> Dict[str, Any]:
-        """Return the min/max dates and unique days with data for a symbol."""
+    async def get_valid_date_range(self, symbol: str, interval: Optional[str] = None) -> Dict[str, Any]:
+        """Return the min/max dates and unique days with data for a symbol and optional interval."""
         import asyncio
         def _get_range():
             client = _get_client()
             if client is None:
                 return {"min_date": None, "max_date": None, "valid_dates": []}
             try:
-                # Get min/max
-                res_range = client.query(
-                    f"SELECT min(open_time), max(open_time) FROM klines WHERE symbol='{symbol}'"
-                )
-                min_dt, max_dt = res_range.result_rows[0]
-                
-                # Get unique days
-                res_days = client.query(
-                    f"SELECT DISTINCT toDate(open_time) FROM klines WHERE symbol='{symbol}' ORDER BY toDate(open_time)"
-                )
-                valid_dates = [str(r[0]) for r in res_days.result_rows]
-                
+                with _client_lock:
+                    # Build condition with optional interval filter
+                    conditions = [f"symbol='{symbol}'"]
+                    if interval:
+                        conditions.append(f"interval='{interval}'")
+
+                    cond_str = " AND ".join(conditions)
+
+                    # Get min/max
+                    res_range = client.query(
+                        f"SELECT min(open_time), max(open_time) FROM klines WHERE {cond_str}"
+                    )
+                    min_dt, max_dt = res_range.result_rows[0] if res_range.result_rows else (None, None)
+
+                    # Get unique days
+                    res_days = client.query(
+                        f"SELECT DISTINCT toDate(open_time) FROM klines WHERE {cond_str} ORDER BY toDate(open_time)"
+                    )
+                    valid_dates = [str(r[0]) for r in res_days.result_rows]
+
                 return {
                     "min_date": min_dt,
                     "max_date": max_dt,
                     "valid_dates": valid_dates
                 }
             except Exception as e:
-                logger.error(f"ClickHouse get_valid_date_range failed for {symbol}: {e}")
+                logger.error(f"ClickHouse get_valid_date_range failed for {symbol}/{interval}: {e}")
                 return {"min_date": None, "max_date": None, "valid_dates": []}
         
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _get_range)
+
+
+    # ── Get max timestamp ──────────────────────────────────────────────────────
+    async def get_max_timestamp(self, symbol: str, interval: str) -> Optional[datetime]:
+        """
+        Get the maximum open_time timestamp for a given symbol/interval.
+        Returns None if no data exists.
+        """
+        import asyncio
+
+        def _get():
+            client = _get_client()
+            if client is None:
+                return None
+            try:
+                with _client_lock:
+                    result = client.query(
+                        f"SELECT max(open_time) FROM klines WHERE symbol='{symbol}' AND interval='{interval}'"
+                    )
+                    if result.result_rows:
+                        val = result.result_rows[0][0]
+                        return val if val else None
+                return None
+            except Exception as e:
+                logger.warning(f"get_max_timestamp failed ({symbol}/{interval}): {e}")
+                return None
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get)
+
+    # ── Get data gaps ──────────────────────────────────────────────────────────
+    async def get_data_gaps(
+        self,
+        symbol: str,
+        interval: str,
+        expected_start: datetime,
+        expected_end: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect gaps in K-line data for a symbol/interval between expected_start and expected_end.
+
+        Returns a list of gap dicts:
+            [{"start": datetime, "end": datetime, "missing_minutes": int}, ...]
+        """
+        import asyncio
+
+        def _get():
+            client = _get_client()
+            if client is None:
+                return []
+
+            # Interval duration in minutes
+            interval_minutes = {
+                "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                "1h": 60, "2h": 120, "4h": 240, "6h": 360,
+                "8h": 480, "12h": 720, "1d": 1440,
+                "3d": 4320, "1w": 10080, "1M": 43200,
+            }.get(interval, 1)
+
+            try:
+                with _client_lock:
+                    # Fetch all timestamps in the expected range
+                    rows = client.query(
+                        f"""
+                        SELECT open_time FROM klines
+                        WHERE symbol='{symbol}' AND interval='{interval}'
+                          AND open_time >= '{expected_start.strftime('%Y-%m-%d %H:%M:%S')}'
+                          AND open_time <= '{expected_end.strftime('%Y-%m-%d %H:%M:%S')}'
+                        ORDER BY open_time ASC
+                        """
+                    ).result_rows
+
+                if not rows:
+                    # All data is missing
+                    diff = (expected_end - expected_start).total_seconds() / 60
+                    return [{
+                        "start": expected_start,
+                        "end": expected_end,
+                        "missing_minutes": int(diff),
+                    }]
+
+                gaps = []
+                prev_ts = None
+                for row in rows:
+                    ts = row[0]
+                    if prev_ts is not None:
+                        diff_minutes = (ts - prev_ts).total_seconds() / 60
+                        # Gap detected if diff > interval_minutes * 1.5 (allow 50% tolerance)
+                        if diff_minutes > interval_minutes * 1.5:
+                            gaps.append({
+                                "start": prev_ts,
+                                "end": ts,
+                                "missing_minutes": int(diff_minutes - interval_minutes),
+                            })
+                    prev_ts = ts
+
+                return gaps
+
+            except Exception as e:
+                logger.warning(f"get_data_gaps failed ({symbol}/{interval}): {e}")
+                return []
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get)
+
+    # ── Get all data ranges (for health check) ─────────────────────────────────
+    async def get_all_data_ranges(self) -> List[Dict[str, Any]]:
+        """
+        Return summary of all stored data: symbol, interval, min_time, max_time, row_count.
+        """
+        import asyncio
+
+        def _get():
+            client = _get_client()
+            if client is None:
+                return []
+            try:
+                with _client_lock:
+                    result = client.query(
+                        """
+                        SELECT symbol, interval,
+                               min(open_time) AS min_time,
+                               max(open_time) AS max_time,
+                               count()        AS row_count
+                        FROM klines
+                        GROUP BY symbol, interval
+                        ORDER BY symbol, interval
+                        """
+                    )
+                return [
+                    {
+                        "symbol": r[0],
+                        "interval": r[1],
+                        "min_time": r[2],
+                        "max_time": r[3],
+                        "row_count": r[4],
+                    }
+                    for r in result.result_rows
+                ]
+            except Exception as e:
+                logger.warning(f"get_all_data_ranges failed: {e}")
+                return []
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get)
 
 
 # Singleton
