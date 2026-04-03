@@ -64,6 +64,7 @@ verify_*.py
 
 # ── Misc project-local files ──────────────────────────────────────────────────
 review_*.txt
+review_*.py
 工程功能评估报告.md
 技术债务记录*.txt
 智能体Skill系统使用指南.md
@@ -74,3 +75,10 @@ prompt认知.txt
 调研*.txt
 策略组合功能实现文档.md
 backend/backend/
+
+# ── Backup & temp files ──────────────────────────────────────────────────────
+*.backup
+*.bak
+*.tmp
+fix_*.js
+fix_*.py
