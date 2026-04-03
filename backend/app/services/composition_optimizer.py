@@ -4,18 +4,16 @@
 """
 
 import logging
-import asyncio
 import itertools
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 
 from app.services.strategy_templates import get_all_templates_meta, build_signal_func
 from app.services.binance_service import binance_service
 from app.services.clickhouse_service import clickhouse_service
 from app.services.backtester.event_driven import EventDrivenBacktester
-from app.strategies.composition.factory import CompositionFactory
 from app.strategies.composition.weighted import WeightedComposer
 from app.strategies.composition.voting import VotingComposer
 
@@ -233,11 +231,12 @@ class CompositionOptimizer:
                 combined_signal = await composer.combine_signals(df, atomic_signals)
                 
                 # 回测评估
-                performance = await self._evaluate_composition(
+                eval_result = await self._evaluate_composition(
                     df, combined_signal, initial_capital
                 )
                 
-                if performance:
+                if eval_result:
+                    performance = eval_result["performance"]
                     results.append({
                         "params": params,
                         "performance": performance,
@@ -318,11 +317,12 @@ class CompositionOptimizer:
                 combined_signal = await composer.combine_signals(df, atomic_signals)
                 
                 # 回测评估
-                performance = await self._evaluate_composition(
+                eval_result = await self._evaluate_composition(
                     df, combined_signal, initial_capital
                 )
                 
-                if performance:
+                if eval_result:
+                    performance = eval_result["performance"]
                     results.append({
                         "params": params,
                         "performance": performance,
@@ -420,9 +420,14 @@ class CompositionOptimizer:
         df: pd.DataFrame,
         combined_signal: pd.Series,
         initial_capital: float,
-        commission: float = 0.001
+        commission: float = 0.001,
+        max_equity_points: int = 500
     ) -> Optional[Dict[str, Any]]:
-        """评估组合策略性能"""
+        """评估组合策略性能
+        
+        Returns:
+            包含 performance、equity_curve、trades 的字典
+        """
         
         try:
             # 使用事件驱动回测器
@@ -447,11 +452,100 @@ class CompositionOptimizer:
                 "final_capital": result.get("final_capital", initial_capital)
             }
             
-            return performance
+            # 处理权益曲线数据 - 转换为 [{"t": ISO时间, "v": 权益值}, ...] 格式
+            equity_curve_raw = result.get("equity_curve", [])
+            equity_curve = self._format_equity_curve(df, equity_curve_raw, max_equity_points)
+            
+            # 获取交易记录
+            trades = result.get("trades", [])
+            
+            return {
+                "performance": performance,
+                "equity_curve": equity_curve,
+                "trades": trades
+            }
             
         except Exception as e:
             logger.warning(f"组合评估失败: {e}")
             return None
+    
+    def _format_equity_curve(
+        self,
+        df: pd.DataFrame,
+        equity_curve_raw: List[float],
+        max_points: int = 500
+    ) -> List[Dict[str, Any]]:
+        """格式化权益曲线数据
+            
+        Args:
+            df: 原始数据DataFrame
+            equity_curve_raw: 原始权益曲线值列表
+            max_points: 最大数据点数（采样）
+                
+        Returns:
+            [{"t": ISO时间字符串, "v": 权益值}, ...]
+        """
+        if not equity_curve_raw or len(equity_curve_raw) == 0:
+            return []
+    
+        # 获取时间戳
+        if isinstance(df.index, pd.DatetimeIndex):
+            timestamps = df.index
+        elif 'open_time' in df.columns:
+            timestamps = pd.to_datetime(df['open_time'])
+        elif 'timestamp' in df.columns:
+            timestamps = pd.to_datetime(df['timestamp'])
+        else:
+            # 如果没有时间信息，生成 fallback 序列时间
+            timestamps = pd.date_range(
+                start=datetime.utcnow() - pd.Timedelta(hours=len(equity_curve_raw)),
+                periods=len(equity_curve_raw),
+                freq='h'
+            )
+    
+        # 采样逻辑
+        n_points = len(equity_curve_raw)
+        if n_points > max_points:
+            step = n_points // max_points
+            indices = list(range(0, n_points, step))[:max_points]
+        else:
+            indices = list(range(n_points))
+    
+        # 构建结果
+        result = []
+        timestamps_len = len(timestamps) if timestamps is not None else 0
+            
+        for i in indices:
+            # 索引越界保护
+            if timestamps is None or i >= timestamps_len:
+                continue
+                    
+            try:
+                ts = timestamps[i]
+                if isinstance(ts, pd.Timestamp):
+                    ts_str = ts.isoformat()
+                elif pd.isna(ts):
+                    # 跳过无效时间戳
+                    continue
+                else:
+                    ts_str = str(ts)[:19]  # 简单截断
+                    # 验证是否为有效格式
+                    if not ts_str or ts_str == 'NaT':
+                        continue
+            except (IndexError, TypeError, ValueError) as e:
+                logger.warning(f"时间戳转换失败 (索引 {i}): {e}")
+                continue
+                
+            # 确保 ts_str 是有效字符串
+            if not isinstance(ts_str, str) or not ts_str:
+                continue
+                    
+            result.append({
+                "t": ts_str,
+                "v": float(equity_curve_raw[i])
+            })
+    
+        return result
     
     async def compare_composition_types(
         self,
@@ -461,9 +555,15 @@ class CompositionOptimizer:
         data_limit: int = 500,
         initial_capital: float = 10000.0
     ) -> Dict[str, Any]:
-        """比较不同组合类型的表现"""
+        """比较不同组合类型的表现
+        
+        Returns:
+            包含 performance、equity_curves、weight_distribution、signal_stats 的字典
+        """
         
         comparison_results = {}
+        equity_curves = {}
+        weight_distribution = {}
         
         # 获取历史数据
         df = await self._fetch_historical_data(
@@ -475,6 +575,9 @@ class CompositionOptimizer:
         # 获取原子策略信号
         atomic_signals = await self._run_atomic_strategies(df, atomic_strategies)
         
+        # 计算信号统计
+        signal_stats = self._calculate_signal_stats(atomic_signals)
+        
         # 测试每种组合类型
         composition_types = ["weighted", "voting"]
         
@@ -483,36 +586,39 @@ class CompositionOptimizer:
                 logger.info(f"测试组合类型: {comp_type}")
                 
                 if comp_type == "weighted":
-                    # 使用等权重作为基准
                     weights = {name: 1.0/len(atomic_strategies) for name in atomic_strategies}
                     composer = WeightedComposer(
                         composition_id=f"compare_{comp_type}",
                         weights=weights,
-                        threshold=0.5
+                        threshold=0.3  # 加权使用较低阈值(0.3)，更敏感，信号加权后>0.3即触发
                     )
+                    # 记录权重分布
+                    weight_distribution[comp_type] = weights
                 else:  # voting
                     composer = VotingComposer(
                         composition_id=f"compare_{comp_type}",
-                        threshold=0.5,
-                        veto_power=False
+                        threshold=0.4,       # 从0.5改为0.4，允许少数服从多数（>40%即触发）
+                        veto_power=True      # 保留冲突回避
                     )
                 
                 # 生成组合信号
                 combined_signal = await composer.combine_signals(df, atomic_signals)
                 
                 # 评估性能
-                performance = await self._evaluate_composition(
+                eval_result = await self._evaluate_composition(
                     df, combined_signal, initial_capital
                 )
                 
-                if performance:
+                if eval_result:
                     comparison_results[comp_type] = {
-                        "performance": performance,
+                        "performance": eval_result["performance"],
                         "composer_params": {
                             "type": comp_type,
                             "params": composer.__dict__
                         }
                     }
+                    # 收集权益曲线
+                    equity_curves[comp_type] = eval_result.get("equity_curve", [])
                     
             except Exception as e:
                 logger.warning(f"组合类型 {comp_type} 测试失败: {e}")
@@ -520,14 +626,90 @@ class CompositionOptimizer:
                     "error": str(e),
                     "performance": None
                 }
+                # 确保即使失败也有空列表条目，保持数据结构一致
+                equity_curves[comp_type] = []
         
-        # 添加原子策略的独立表现
+        # 添加原子策略的独立表现和权益曲线
         atomic_performances = {}
         for strategy_name, signal in atomic_signals.items():
-            perf = await self._evaluate_composition(df, signal, initial_capital)
-            if perf:
-                atomic_performances[strategy_name] = perf
+            eval_result = await self._evaluate_composition(df, signal, initial_capital)
+            if eval_result:
+                atomic_performances[strategy_name] = eval_result["performance"]
+                # 收集原子策略的权益曲线
+                equity_curves[strategy_name] = eval_result.get("equity_curve", [])
         
         comparison_results["atomic_strategies"] = atomic_performances
+        comparison_results["equity_curves"] = equity_curves
+        comparison_results["weight_distribution"] = weight_distribution
+        comparison_results["signal_stats"] = signal_stats
         
         return comparison_results
+    
+    def _calculate_signal_stats(
+        self,
+        atomic_signals: Dict[str, pd.Series]
+    ) -> Dict[str, Dict[str, Any]]:
+        """计算各策略的信号统计
+        
+        Args:
+            atomic_signals: 各策略的信号序列字典
+            
+        Returns:
+            各策略的信号统计信息
+        """
+        stats = {}
+        
+        # 收集所有策略的信号用于计算一致性
+        all_signals = []
+        strategy_names = list(atomic_signals.keys())
+        
+        for strategy_name, signals in atomic_signals.items():
+            # 确保信号是numpy数组
+            sig_array = signals.fillna(0).values if isinstance(signals, pd.Series) else np.array(signals)
+            
+            buy_signals = int(np.sum(sig_array == 1))
+            sell_signals = int(np.sum(sig_array == -1))
+            neutral_signals = int(np.sum(sig_array == 0))
+            total = len(sig_array)
+            
+            signal_rate = (buy_signals + sell_signals) / total if total > 0 else 0.0
+            
+            stats[strategy_name] = {
+                "buy_signals": buy_signals,
+                "sell_signals": sell_signals,
+                "neutral_signals": neutral_signals,
+                "signal_rate": round(signal_rate, 4),
+                "total_points": total
+            }
+            
+            all_signals.append(sig_array)
+        
+        # 计算策略间信号一致性（所有策略信号方向一致的时间占比）
+        if len(all_signals) >= 2:
+            # 确保所有信号长度一致
+            min_len = min(len(s) for s in all_signals)
+            all_signals = [s[:min_len] for s in all_signals]
+            
+            # 计算每个时间点的信号和（用于判断一致性）
+            signals_matrix = np.array(all_signals)  # shape: (n_strategies, n_points)
+            
+            # 计算完全一致的点（所有策略都看涨或都看跌，排除持有信号）
+            # 方法：过滤掉持有信号(0)后，检查剩余信号是否一致
+            agreement_count = 0
+            for i in range(min_len):
+                # 过滤掉持有信号(0)
+                signals_with_opinion = signals_matrix[:, i][signals_matrix[:, i] != 0]
+                if len(signals_with_opinion) > 0:
+                    # 有实际买卖意见时，检查是否完全一致
+                    if np.all(signals_with_opinion == signals_with_opinion[0]):
+                        agreement_count += 1
+            
+            agreement_rate = agreement_count / min_len if min_len > 0 else 0.0
+            
+            stats["_meta"] = {
+                "agreement_rate": round(agreement_rate, 4),
+                "strategies_count": len(strategy_names),
+                "common_points": min_len
+            }
+        
+        return stats

@@ -201,10 +201,16 @@ async def run_backtest(req: BacktestRequest):
             logger.warning(f"ClickHouse query failed: {e}, falling back to Binance")
             df = None
 
-        # 如果 ClickHouse 数据不足，回退到 Binance（但 Binance 不支持时间范围，只能用 limit）
+        # 如果 ClickHouse 数据不足，回退到 Binance（支持时间范围查询）
         if df is None:
             try:
-                df = await binance_service.get_klines_dataframe(symbol_ccxt, req.interval, limit=effective_limit)
+                df = await binance_service.get_klines_dataframe(
+                    symbol_ccxt, 
+                    req.interval, 
+                    limit=effective_limit,
+                    start=req.start_time,
+                    end=req.end_time
+                )
                 if df is not None and len(df) >= 50:
                     logger.warning(
                         f"Time range query fell back to Binance (limit={effective_limit}). "
@@ -383,16 +389,64 @@ async def get_backtest_history(
         equity_curve = row.equity_curve if row.equity_curve else []
         trades_summary = row.trades_summary if row.trades_summary else []
         
+        # Reconstruct markers from trades_summary
+        markers = []
+        for t in trades_summary:
+            # Buy marker (Entry)
+            markers.append({
+                "time": t.get("entry_time", ""),
+                "price": t.get("entry_price", 0),
+                "side": "BUY",
+                "pnl": None
+            })
+            # Sell marker (Exit)
+            markers.append({
+                "time": t.get("exit_time", ""),
+                "price": t.get("exit_price", 0),
+                "side": "SELL",
+                "pnl": t.get("pnl")
+            })
+        # Sort markers by time
+        markers.sort(key=lambda x: x.get("time", ""))
+        
+        # Reconstruct baseline_curve from equity_curve (buy-and-hold approximation)
+        # If we have equity_curve with timestamps, create a simple baseline
+        baseline_curve = []
+        if equity_curve and len(equity_curve) >= 2:
+            # Get initial equity value
+            initial_value = equity_curve[0].get("v", equity_curve[0].get("value", 10000))
+            # Create a flat baseline (simplified; ideally should recalculate from price data)
+            # For now, use the first and last points to create a reference line
+            baseline_curve = [
+                {"t": equity_curve[0].get("t", equity_curve[0].get("time", "")), "v": initial_value},
+                {"t": equity_curve[-1].get("t", equity_curve[-1].get("time", "")), "v": initial_value}
+            ]
+        
+        # Ensure metrics has all required fields with default values
+        metrics = row.metrics or {}
+        metrics = {
+            "total_return": metrics.get("total_return", 0),
+            "annual_return": metrics.get("annual_return", 0),
+            "max_drawdown": metrics.get("max_drawdown", 0),
+            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
+            "win_rate": metrics.get("win_rate", 0),
+            "profit_factor": metrics.get("profit_factor", 0),
+            "total_trades": metrics.get("total_trades", len(trades_summary)),  # Fallback to trades count
+            "total_commission": metrics.get("total_commission", 0),
+            "initial_capital": metrics.get("initial_capital", 10000),
+            "final_capital": metrics.get("final_capital", initial_value if equity_curve else 10000),
+        }
+        
         history.append({
             "id":             row.id,
             "strategy_type":  row.strategy_type,
             "symbol":         row.symbol,
             "interval":       row.interval,
             "params":         row.params,
-            "metrics":        row.metrics,
+            "metrics":        metrics,
             "equity_curve":   equity_curve,
-            "baseline_curve": [],  # Not stored in DB, will be empty
-            "markers":        [],   # Not stored in DB, will be empty
+            "baseline_curve": baseline_curve,
+            "markers":        markers,
             "trades":         trades_summary,
             "created_at":     row.created_at.isoformat() if row.created_at else None,
         })

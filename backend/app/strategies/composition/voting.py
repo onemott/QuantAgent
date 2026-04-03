@@ -6,7 +6,7 @@
 import logging
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 from .base import StrategyComposer
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,8 @@ class VotingComposer(StrategyComposer):
     
     Args:
         threshold: 投票阈值 (0-1)，默认0.5表示简单多数
-        veto_power: 是否有一票否决权
+        veto_power: 是否启用冲突回避机制。当启用且买卖信号同时存在时，
+                    为规避风险选择持有，而非传统意义上的"一票否决"
     """
     
     def __init__(
@@ -59,13 +60,14 @@ class VotingComposer(StrategyComposer):
             # 统计投票
             buy_votes = (row == 1).sum()
             sell_votes = (row == -1).sum()
-            hold_votes = total_votes - buy_votes - sell_votes
-            
-            # 一票否决机制
+
+            # 冲突回避机制（分歧持有）
+            # 当启用 veto_power 且买卖信号同时存在时，为安全起见选择持有
+            # 这不是传统意义上的"一票否决"，而是一种风险规避策略：
+            # 当策略之间存在分歧时，避免做出可能错误的交易决策
             if self.veto_power:
-                # 如果有任意一个策略强烈反对 (信号为相反方向)
-                # 这里简化处理：如果有买票同时有卖票，则持有
                 if buy_votes > 0 and sell_votes > 0:
+                    # 存在买卖分歧，选择持有以规避风险
                     return 0
             
             # 计算投票比例
@@ -73,9 +75,9 @@ class VotingComposer(StrategyComposer):
             sell_ratio = sell_votes / total_votes
             
             # 应用阈值
-            if buy_ratio >= self.threshold:
+            if buy_ratio > self.threshold:      # 严格大于，边界值不触发
                 return 1
-            elif sell_ratio >= self.threshold:
+            elif sell_ratio > self.threshold:    # 严格大于
                 return -1
             else:
                 return 0
@@ -182,8 +184,7 @@ class VotingComposer(StrategyComposer):
         
         # 使用其他策略重新投票
         other_signals = signals_df[other_strategies]
-        n_other = len(other_strategies)
-        
+
         def _other_vote(row):
             buy_votes = (row == 1).sum()
             sell_votes = (row == -1).sum()

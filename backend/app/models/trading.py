@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from enum import Enum
 
@@ -93,6 +93,10 @@ class ReplayStatusResponse(BaseModel):
     progress: float = 0.0
     pnl: float = 0.0
     elapsed_seconds: Optional[float] = None  # 实际消耗时间(秒)
+    error_count: int = 0
+    warnings: List[str] = []
+    bars_processed: int = 0
+    bars_total: int = 0
 
 class ReplayJumpRequest(BaseModel):
     """Request to jump to a specific time in replay"""

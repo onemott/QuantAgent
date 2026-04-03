@@ -783,12 +783,12 @@ def _load_db_default_params() -> Dict[str, Dict[str, float]]:
                 logger.info(f"从数据库加载了 {len(rows)} 条自定义默认参数: {_db_default_params_cache}")
         
         # 在同步模块中运行异步函数
-        import asyncio
+        from app.core.async_utils import get_safe_event_loop
+        import concurrent.futures
         try:
-            loop = asyncio.get_event_loop()
+            loop = get_safe_event_loop()
             if loop.is_running():
                 # 已在异步上下文中，通过线程池创建新事件循环
-                import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(asyncio.run, _fetch())
                     future.result()
@@ -851,11 +851,11 @@ def _save_param_to_db(strategy_type: str, param_key: str, param_value: float, up
                 await session.commit()
                 logger.info(f"已保存参数 {strategy_type}.{param_key}={param_value}，更新者: {updated_by}")
         
-        import asyncio
+        from app.core.async_utils import get_safe_event_loop
+        import concurrent.futures
         try:
-            loop = asyncio.get_event_loop()
+            loop = get_safe_event_loop()
             if loop.is_running():
-                import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(asyncio.run, _save())
                     future.result(timeout=5)  # 设置超时确保完成
@@ -863,7 +863,7 @@ def _save_param_to_db(strategy_type: str, param_key: str, param_value: float, up
                 loop.run_until_complete(_save())
         except Exception as e:
             logger.warning(f"无法保存参数到数据库: {e}")
-    
+
     except ImportError as e:
         logger.warning(f"无法导入数据库模块进行保存: {e}")
 
@@ -915,11 +915,11 @@ def _save_all_params_to_db(strategy_type: str, params: Dict[str, float], updated
                 await session.commit()
                 logger.info(f"已为策略 {strategy_type} 保存 {len(params)} 个参数，更新者: {updated_by}")
         
-        import asyncio
+        from app.core.async_utils import get_safe_event_loop
+        import concurrent.futures
         try:
-            loop = asyncio.get_event_loop()
+            loop = get_safe_event_loop()
             if loop.is_running():
-                import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(asyncio.run, _save_all())
                     future.result(timeout=10)
@@ -927,7 +927,7 @@ def _save_all_params_to_db(strategy_type: str, params: Dict[str, float], updated
                 loop.run_until_complete(_save_all())
         except Exception as e:
             logger.warning(f"无法批量保存参数到数据库: {e}")
-    
+
     except ImportError as e:
         logger.warning(f"无法导入数据库模块进行批量保存: {e}")
 
@@ -998,6 +998,79 @@ def get_replay_templates() -> List[Dict[str, Any]]:
     return get_all_templates_meta(include_all=False)
 
 
+def _safe_signal_wrapper(raw_func, validated: Dict[str, Any], is_async: bool = False):
+    """
+    对信号函数进行安全包装，捕获常见计算异常。
+    异常时返回全 0 Series（无信号），并记录 WARNING 日志。
+    """
+    if is_async:
+        async def signal_func_async(df: pd.DataFrame) -> pd.Series:
+            try:
+                # 检查 DataFrame 有效性
+                if df is None or df.empty:
+                    logger.warning("信号函数收到空 DataFrame，返回全 0 信号")
+                    return pd.Series(0, index=pd.DatetimeIndex([]))
+                result = await raw_func(df, **validated)
+                return _sanitize_signal_result(result, df)
+            except Exception as e:
+                logger.warning(f"异步信号函数异常: {type(e).__name__}: {e}，返回全 0 信号")
+                return pd.Series(0, index=df.index if df is not None else pd.DatetimeIndex([]))
+        return signal_func_async
+    else:
+        def signal_func_sync(df: pd.DataFrame) -> pd.Series:
+            try:
+                # 检查 DataFrame 有效性
+                if df is None or df.empty:
+                    logger.warning("信号函数收到空 DataFrame，返回全 0 信号")
+                    return pd.Series(0, index=pd.DatetimeIndex([]))
+                result = raw_func(df, **validated)
+                return _sanitize_signal_result(result, df)
+            except Exception as e:
+                logger.warning(f"信号函数异常: {type(e).__name__}: {e}，返回全 0 信号")
+                return pd.Series(0, index=df.index if df is not None else pd.DatetimeIndex([]))
+        return signal_func_sync
+
+
+def _sanitize_signal_result(result: Any, df: pd.DataFrame) -> pd.Series:
+    """
+    清理信号函数返回结果，处理 NaN/Inf、空 Series、索引不匹配等问题。
+    """
+    # 检查结果类型
+    if result is None:
+        logger.warning("信号函数返回 None，返回全 0 信号")
+        return pd.Series(0, index=df.index)
+
+    if not isinstance(result, pd.Series):
+        logger.warning(f"信号函数返回类型异常: {type(result)}，返回全 0 信号")
+        return pd.Series(0, index=df.index)
+
+    # 处理空 Series
+    if len(result) == 0:
+        logger.warning("信号函数返回空 Series，返回全 0 信号")
+        return pd.Series(0, index=df.index)
+
+    # 处理索引不匹配
+    if not result.index.equals(df.index):
+        # 尝试重新索引
+        try:
+            result = result.reindex(df.index, fill_value=0)
+        except Exception as e:
+            logger.warning(f"信号结果索引重排失败: {e}，返回全 0 信号")
+            return pd.Series(0, index=df.index)
+
+    # 处理 NaN/Inf 值
+    if result.isna().any() or np.isinf(result).any():
+        nan_count = result.isna().sum()
+        inf_count = np.isinf(result).sum()
+        logger.warning(f"信号结果包含 {nan_count} 个 NaN 和 {inf_count} 个 Inf，已替换为 0")
+        result = result.replace([np.inf, -np.inf], 0).fillna(0)
+
+    # 确保信号值为整数（-1, 0, 1）
+    result = result.astype(int)
+
+    return result
+
+
 def build_signal_func(strategy_type: str, params: Dict[str, Any]) -> Callable:
     """返回一个已绑定参数的信号函数 signal_func(df) -> pd.Series。"""
     template = get_template(strategy_type)
@@ -1016,13 +1089,7 @@ def build_signal_func(strategy_type: str, params: Dict[str, Any]) -> Callable:
         validated[key] = val
 
     import inspect
-    if inspect.iscoroutinefunction(raw_func):
-        # 异步策略：包装为异步信号函数
-        async def signal_func_async(df: pd.DataFrame) -> pd.Series:
-            return await raw_func(df, **validated)
-        return signal_func_async
-    else:
-        # 同步策略：包装为同步信号函数
-        def signal_func_sync(df: pd.DataFrame) -> pd.Series:
-            return raw_func(df, **validated)
-        return signal_func_sync
+    is_async = inspect.iscoroutinefunction(raw_func)
+
+    # 返回安全包装的信号函数
+    return _safe_signal_wrapper(raw_func, validated, is_async)

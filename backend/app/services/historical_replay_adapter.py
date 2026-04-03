@@ -39,6 +39,12 @@ class HistoricalReplayAdapter(DataAdapter):
         self._total_paused_time: float = 0.0
         self._pause_start_time: Optional[float] = None
 
+        # Error tracking and health monitoring
+        self.error_count = 0
+        self.warnings: list = []  # 最多保留最近20条
+        self.bars_processed = 0
+        self._db_update_failures = 0
+
     def _ensure_tz_aware(self, dt: datetime) -> datetime:
         """Ensure datetime is timezone-aware (UTC)."""
         if dt.tzinfo is None:
@@ -150,8 +156,17 @@ class HistoricalReplayAdapter(DataAdapter):
                 )
                 await session.commit()
             self._last_db_update_time = datetime.now()
+            self._db_update_failures = 0  # Reset failure counter on success
         except Exception as e:
+            self._db_update_failures += 1
             logger.error(f"Failed to update DB progress for {session_id}: {e}")
+            # Add warning if consecutive failures exceed threshold
+            if self._db_update_failures >= 3:
+                warning_msg = f"DB进度更新连续失败{self._db_update_failures}次，回放数据可能无法持久化"
+                self.warnings.append(warning_msg)
+                # Keep only last 20 warnings
+                if len(self.warnings) > 20:
+                    self.warnings.pop(0)
 
     async def _record_equity_snapshot(self, current_bar: BarData):
         """Record equity snapshot with simulated timestamp."""
@@ -187,28 +202,53 @@ class HistoricalReplayAdapter(DataAdapter):
             f"Loading historical data for {symbol} {interval} from {self.config.start_time} to {self.config.end_time}"
         )
 
-        # ClickHouseService.query_klines already returns data sorted by open_time ASC
-        rows = await clickhouse_service.query_klines(
-            symbol=symbol,
-            interval=interval,
-            start=self.config.start_time,
-            end=self.config.end_time,
-            limit=1000000,  # Large limit for replay
-        )
-
-        self.data = [
-            BarData(
+        try:
+            # ClickHouseService.query_klines already returns data sorted by open_time ASC
+            rows = await clickhouse_service.query_klines(
                 symbol=symbol,
-                datetime=r["open_time"],
-                open=r["open"],
-                high=r["high"],
-                low=r["low"],
-                close=r["close"],
-                volume=r["volume"],
                 interval=interval,
+                start=self.config.start_time,
+                end=self.config.end_time,
+                limit=1000000,  # Large limit for replay
             )
-            for r in rows
-        ]
+        except Exception as e:
+            logger.error(
+                f"Failed to load historical data from ClickHouse: "
+                f"symbol={symbol}, interval={interval}, "
+                f"start_time={self.config.start_time}, end_time={self.config.end_time}, "
+                f"error={type(e).__name__}: {e}"
+            )
+            raise RuntimeError(
+                f"Failed to load historical data for {symbol} {interval} "
+                f"({self.config.start_time} to {self.config.end_time}): {e}"
+            ) from e
+
+        try:
+            self.data = [
+                BarData(
+                    symbol=symbol,
+                    datetime=r["open_time"],
+                    open=r["open"],
+                    high=r["high"],
+                    low=r["low"],
+                    close=r["close"],
+                    volume=r["volume"],
+                    interval=interval,
+                )
+                for r in rows
+            ]
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(
+                f"Failed to parse ClickHouse response data: "
+                f"symbol={symbol}, interval={interval}, "
+                f"rows_count={len(rows) if rows else 0}, "
+                f"sample_row={rows[0] if rows else 'N/A'}, "
+                f"error={type(e).__name__}: {e}"
+            )
+            raise RuntimeError(
+                f"Failed to parse historical data for {symbol} {interval}: {e}"
+            ) from e
+
         self.cursor = 0
         logger.info(f"Loaded {len(self.data)} bars for replay")
         if self.data:
@@ -226,7 +266,14 @@ class HistoricalReplayAdapter(DataAdapter):
         """
         for symbol in symbols:
             # For simplicity, we assume one symbol per replay session for now
-            await self._load_and_sort_data(symbol, interval)
+            try:
+                await self._load_and_sort_data(symbol, interval)
+            except Exception as e:
+                logger.error(
+                    f"Failed to load data during subscribe: symbol={symbol}, interval={interval}, "
+                    f"error={type(e).__name__}: {e}"
+                )
+                raise
             # Register callback with bus
             self.bus.subscribe_bars(callback)
 
@@ -248,6 +295,7 @@ class HistoricalReplayAdapter(DataAdapter):
 
         self._start_real_time = time.time()
         self._start_sim_time = self.data[self.cursor].datetime
+        playback_start_time = datetime.now()  # For elapsed time calculation
 
         logger.info(
             f"Replay playback started at {self._start_sim_time} with speed {self.config.speed}x"
@@ -266,8 +314,16 @@ class HistoricalReplayAdapter(DataAdapter):
 
             current_bar = self.data[self.cursor]
 
-            # Publish bar to bus
-            await self.bus.publish_bar(current_bar)
+            # Publish bar to bus - wrap in try-except to prevent single bar failure from stopping replay
+            try:
+                await self.bus.publish_bar(current_bar)
+            except Exception as e:
+                self.error_count += 1
+                error_msg = f"Failed to publish bar (cursor={self.cursor}, time={current_bar.datetime}): {type(e).__name__}: {e}"
+                self.warnings.append(error_msg)
+                if len(self.warnings) > 20:
+                    self.warnings.pop(0)
+                logger.error(f"{error_msg}. Continuing replay...")
 
             # Match pending limit orders using this bar's OHLC prices (not real-time)
             bar_prices = {
@@ -279,14 +335,31 @@ class HistoricalReplayAdapter(DataAdapter):
                 }
             }
             session_id = getattr(self.bus, "session_id", None)
-            await paper_trading_service.match_orders_with_bar_price(
-                bar_prices=bar_prices,
-                session_id=session_id,
-            )
+            try:
+                await paper_trading_service.match_orders_with_bar_price(
+                    bar_prices=bar_prices,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                self.error_count += 1
+                error_msg = f"Failed to match orders for bar (cursor={self.cursor}, time={current_bar.datetime}): {type(e).__name__}: {e}"
+                self.warnings.append(error_msg)
+                if len(self.warnings) > 20:
+                    self.warnings.pop(0)
+                logger.error(f"{error_msg}. Continuing replay...")
 
             # Record equity snapshot periodically (every hour of simulated time)
-            await self._record_equity_snapshot(current_bar)
+            try:
+                await self._record_equity_snapshot(current_bar)
+            except Exception as e:
+                self.error_count += 1
+                error_msg = f"Failed to record equity snapshot (cursor={self.cursor}): {type(e).__name__}: {e}"
+                self.warnings.append(error_msg)
+                if len(self.warnings) > 20:
+                    self.warnings.pop(0)
+                logger.error(f"{error_msg}. Continuing replay...")
 
+            self.bars_processed += 1
             self.cursor += 1
 
             # Periodically update DB with current progress
@@ -347,6 +420,9 @@ class HistoricalReplayAdapter(DataAdapter):
             # Record final equity snapshot after close-out
             await self._record_equity_snapshot(final_bar)
 
+        # Calculate elapsed time
+        elapsed = (datetime.now() - playback_start_time).total_seconds()
+
         logger.info(
             f"Historical replay completed (instant mode: {self.config.speed == -1})"
         )
@@ -357,6 +433,15 @@ class HistoricalReplayAdapter(DataAdapter):
                 f"Replay summary: total_bars={len(self.data)}, session_id={session_id}"
             )
             await self._compute_completion_metrics()
+
+        # Final summary log
+        logger.info(
+            f"回放结束 session={session_id}: "
+            f"处理K线={self.bars_processed}/{len(self.data)}, "
+            f"错误数={self.error_count}, "
+            f"DB更新失败={self._db_update_failures}, "
+            f"耗时={elapsed:.1f}秒"
+        )
 
     def _reset_timing_reference(self):
         """Reset the real-time vs sim-time reference after a pause or jump.
@@ -446,6 +531,20 @@ class HistoricalReplayAdapter(DataAdapter):
     async def get_valid_date_range(self, symbol: str) -> Dict[str, Any]:
         """Query ClickHouse for valid date range of a symbol"""
         return await clickhouse_service.get_valid_date_range(symbol)
+
+    def get_health_summary(self) -> dict:
+        """Get health summary for the replay session.
+
+        Returns:
+            dict: Contains error_count, warnings, bars_processed, bars_total, db_update_failures
+        """
+        return {
+            "error_count": self.error_count,
+            "warnings": self.warnings[-20:],
+            "bars_processed": self.bars_processed,
+            "bars_total": len(self.data) if self.data else 0,
+            "db_update_failures": self._db_update_failures,
+        }
 
     async def _clear_trades_after_cursor(self, session_id: Optional[str]):
         """Delete trades and reset positions created after the current cursor position.

@@ -104,7 +104,9 @@ class GridOptimizer:
         param_values = [param_ranges[k] for k in param_names]
         combinations = list(itertools.product(*param_values))
         
-        loop = asyncio.get_running_loop()
+        # Safely get event loop to avoid RuntimeError in some async contexts
+        from app.core.async_utils import get_safe_event_loop
+        loop = get_safe_event_loop()
         
         # Limit max_workers
         max_workers = min(max_workers, 8)

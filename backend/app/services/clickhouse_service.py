@@ -86,6 +86,15 @@ def _ensure_database() -> bool:
         return False
 
 
+def _get_event_loop():
+    """
+    安全获取事件循环，兼容后台任务执行上下文。
+    内部调用统一的 get_safe_event_loop() 实现。
+    """
+    from app.core.async_utils import get_safe_event_loop
+    return get_safe_event_loop()
+
+
 def _get_client():
     """Lazily initialize and return a ClickHouse HTTP client. Returns None on failure."""
     global _client
@@ -140,7 +149,7 @@ class ClickHouseService:
     async def async_init_tables(self) -> bool:
         """Async wrapper for table initialization."""
         import asyncio
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, self.init_tables)
 
     # ── Insert K-lines ────────────────────────────────────────────────────────
@@ -198,7 +207,7 @@ class ClickHouseService:
     ) -> int:
         """Async wrapper for insert_klines_sync."""
         import asyncio
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(
             None, self.insert_klines_sync, symbol, interval, rows
         )
@@ -270,7 +279,7 @@ class ClickHouseService:
     ) -> List[Dict[str, Any]]:
         """Async wrapper for query_klines_sync."""
         import asyncio
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(
             None, self.query_klines_sync, symbol, interval, start, end, limit, offset
         )
@@ -297,6 +306,10 @@ class ClickHouseService:
         df.rename(columns={"close_time": "_close_time"}, inplace=True)
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
+        # Remove duplicate timestamps and ensure ascending order
+        # This prevents frontend error: "data must be asc ordered by time"
+        df = df[~df.index.duplicated(keep='last')]
+        df = df.sort_index()
         return df
 
     # ── Availability check ────────────────────────────────────────────────────
@@ -313,7 +326,7 @@ class ClickHouseService:
                 return True
             except Exception:
                 return False
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _ping)
 
     # ── Count records ─────────────────────────────────────────────────────────
@@ -332,7 +345,7 @@ class ClickHouseService:
                 return int(result.result_rows[0][0])
             except Exception:
                 return 0
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _count)
 
     async def get_bar_count(
@@ -365,7 +378,7 @@ class ClickHouseService:
             except Exception as e:
                 logger.warning(f"get_bar_count failed ({symbol}/{interval}): {e}")
                 return 0
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _count)
 
     # ── Get date range ────────────────────────────────────────────────────────
@@ -406,7 +419,7 @@ class ClickHouseService:
                 logger.error(f"ClickHouse get_valid_date_range failed for {symbol}/{interval}: {e}")
                 return {"min_date": None, "max_date": None, "valid_dates": []}
         
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _get_range)
 
 
@@ -435,7 +448,7 @@ class ClickHouseService:
                 logger.warning(f"get_max_timestamp failed ({symbol}/{interval}): {e}")
                 return None
 
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _get)
 
     # ── Get data gaps ──────────────────────────────────────────────────────────
@@ -510,7 +523,7 @@ class ClickHouseService:
                 logger.warning(f"get_data_gaps failed ({symbol}/{interval}): {e}")
                 return []
 
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _get)
 
     # ── Get all data ranges (for health check) ─────────────────────────────────
@@ -551,7 +564,7 @@ class ClickHouseService:
                 logger.warning(f"get_all_data_ranges failed: {e}")
                 return []
 
-        loop = asyncio.get_event_loop()
+        loop = _get_event_loop()
         return await loop.run_in_executor(None, _get)
 
 

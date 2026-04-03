@@ -654,6 +654,12 @@ async def get_replay_status(
         pnl = 0.0
         elapsed_seconds = None
         
+        # Health summary defaults
+        error_count = 0
+        warnings = []
+        bars_processed = 0
+        bars_total = 0
+
         # If active, get real-time info
         if replay_session_id in active_replays:
             adapter = active_replays[replay_session_id]
@@ -669,6 +675,12 @@ async def get_replay_status(
                 progress = 0.0
             # Get actual elapsed time
             elapsed_seconds = adapter.get_elapsed_real_time()
+            # Get health summary from adapter
+            health = adapter.get_health_summary()
+            error_count = health.get("error_count", 0)
+            warnings = health.get("warnings", [])
+            bars_processed = health.get("bars_processed", 0)
+            bars_total = health.get("bars_total", 0)
                 
         # Calculate progress if not active but has current_timestamp
         elif session.current_timestamp and session.start_time and session.end_time:
@@ -726,7 +738,11 @@ async def get_replay_status(
             current_simulated_time=current_time,
             progress=progress,
             pnl=pnl,
-            elapsed_seconds=elapsed_seconds
+            elapsed_seconds=elapsed_seconds,
+            error_count=error_count,
+            warnings=warnings,
+            bars_processed=bars_processed,
+            bars_total=bars_total
         )
     except HTTPException:
         raise

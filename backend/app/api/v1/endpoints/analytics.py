@@ -622,21 +622,13 @@ async def replay_quick_backtest(replay_session_id: str):
                 symbol_ccxt = f"{symbol_ccxt[:-len(quote)]}/{quote}"
                 break
 
-    # 计算 since（毫秒时间戳，从 start_time 往前推一些作为预热）
-    since_ms = int(start_time.timestamp() * 1000)
-
+    # 使用 start_time 从 Binance 获取数据
     df = await binance_service.get_klines_dataframe(
-        symbol_ccxt, interval, limit=limit
+        symbol_ccxt, interval, limit=limit, start=start_time, end=end_time
     )
 
     if df is None or len(df) < 50:
         raise HTTPException(status_code=400, detail="回测数据不足（需要至少 50 根 K 线）")
-
-    # 如果数据起点晚于 replay start_time，截取 replay 区间内数据
-    if df.index[0] > start_time:
-        df = df[df.index >= start_time]
-    if df.index[-1] > end_time:
-        df = df[df.index <= end_time]
 
     if len(df) < 20:
         raise HTTPException(status_code=400, detail="回测区间内数据不足（需要至少 20 根 K 线）")

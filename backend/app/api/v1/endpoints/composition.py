@@ -4,7 +4,6 @@
 """
 
 import logging
-import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -14,7 +13,8 @@ from pydantic import BaseModel, Field, validator
 from app.services.composition_optimizer import CompositionOptimizer
 from app.strategies.composition.factory import CompositionFactory
 from app.services.database import get_db
-from app.models.db_models import CompositionResult, BacktestResult
+from app.models.db_models import CompositionResult
+from app.services.strategy_templates import STRATEGY_TEMPLATES, ASYNC_STRATEGIES
 from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
@@ -99,10 +99,36 @@ class CompositionOptimizeRequest(BaseModel):
     
     @validator('atomic_strategies')
     def validate_atomic_strategies(cls, v):
+        # 1. 非空检查
         if not v:
             raise ValueError('原子策略列表不能为空')
+        
+        # 2. 长度检查：组合至少需要2个策略
+        if len(v) < 2:
+            raise ValueError('组合策略至少需要2个原子策略')
+        
+        # 3. 最大长度检查
         if len(v) > 10:
             raise ValueError('原子策略数量不能超过10个')
+        
+        # 4. 检查重复策略名称
+        seen = set()
+        for strategy in v:
+            if strategy in seen:
+                raise ValueError(f'原子策略列表中存在重复的策略: {strategy}')
+            seen.add(strategy)
+        
+        # 5. 验证策略名称是否为已知的合法策略
+        valid_strategies = set(STRATEGY_TEMPLATES.keys())
+        for strategy in v:
+            if strategy not in valid_strategies:
+                raise ValueError(f'未知的策略名称: {strategy}。可用策略: {list(valid_strategies)}')
+        
+        # 6. 检查是否包含异步策略（异步策略不支持历史回放和回测）
+        async_in_list = [s for s in v if s in ASYNC_STRATEGIES]
+        if async_in_list:
+            raise ValueError(f'组合策略不支持异步策略: {async_in_list}。异步策略依赖实时数据，不支持历史回放。')
+        
         return v
 
 
@@ -163,6 +189,40 @@ class CompareCompositionRequest(BaseModel):
     interval: str = Field("1d", description="时间周期")
     data_limit: int = Field(500, description="数据量限制")
     initial_capital: float = Field(10000.0, description="初始资金")
+    
+    @validator('atomic_strategies')
+    def validate_atomic_strategies(cls, v):
+        # 1. 非空检查
+        if not v:
+            raise ValueError('原子策略列表不能为空')
+        
+        # 2. 长度检查：组合至少需要2个策略
+        if len(v) < 2:
+            raise ValueError('组合策略至少需要2个原子策略')
+        
+        # 3. 最大长度检查
+        if len(v) > 10:
+            raise ValueError('原子策略数量不能超过10个')
+        
+        # 4. 检查重复策略名称
+        seen = set()
+        for strategy in v:
+            if strategy in seen:
+                raise ValueError(f'原子策略列表中存在重复的策略: {strategy}')
+            seen.add(strategy)
+        
+        # 5. 验证策略名称是否为已知的合法策略
+        valid_strategies = set(STRATEGY_TEMPLATES.keys())
+        for strategy in v:
+            if strategy not in valid_strategies:
+                raise ValueError(f'未知的策略名称: {strategy}。可用策略: {list(valid_strategies)}')
+        
+        # 6. 检查是否包含异步策略（异步策略不支持历史回放和回测）
+        async_in_list = [s for s in v if s in ASYNC_STRATEGIES]
+        if async_in_list:
+            raise ValueError(f'组合策略不支持异步策略: {async_in_list}。异步策略依赖实时数据，不支持历史回放。')
+        
+        return v
 
 
 class CompositionComparisonItem(BaseModel):
@@ -188,6 +248,24 @@ class CompareCompositionResponse(BaseModel):
     atomic_strategies: Dict[str, CompositionPerformance] = Field(
         ...,
         description="原子策略的独立表现"
+    )
+    
+    # 权益曲线数据（用于前端图表）
+    equity_curves: Optional[Dict[str, List[Dict[str, Any]]]] = Field(
+        None, 
+        description="各策略权益曲线，格式: {strategy_name: [{t: ISO时间, v: 权益值}, ...]}"
+    )
+    
+    # 权重分布（仅加权组合）
+    weight_distribution: Optional[Dict[str, Dict[str, float]]] = Field(
+        None, 
+        description="加权组合权重分布，格式: {weighted: {strategy: weight, ...}}"
+    )
+    
+    # 信号统计
+    signal_stats: Optional[Dict[str, Dict[str, Any]]] = Field(
+        None, 
+        description="各策略信号统计，包含buy/sell/neutral信号数量和一致性"
     )
     
     # 时间戳
@@ -288,7 +366,7 @@ async def optimize_composition(
         
         response = CompositionOptimizeResponse(
             success=True,
-            message=f"策略组合优化完成，找到最优参数组合",
+            message="策略组合优化完成，找到最优参数组合",
             
             composition_type=optimization_result["composition_type"],
             atomic_strategies=optimization_result["atomic_strategies"],
@@ -324,6 +402,7 @@ async def compare_composition_types(req: CompareCompositionRequest):
     比较不同组合类型的表现
     
     在同一组原子策略和历史数据上，比较加权组合和投票组合的表现。
+    返回包含权益曲线、权重分布和信号统计的完整对比数据，支持前端多策略对比图表绘制。
     """
     
     try:
@@ -339,7 +418,8 @@ async def compare_composition_types(req: CompareCompositionRequest):
         # 构建比较结果
         comparisons = {}
         for comp_type, result in comparison_result.items():
-            if comp_type == "atomic_strategies":
+            # 跳过非组合类型的字段
+            if comp_type in ["atomic_strategies", "equity_curves", "weight_distribution", "signal_stats"]:
                 continue
                 
             if result.get("error"):
@@ -366,11 +446,19 @@ async def compare_composition_types(req: CompareCompositionRequest):
             if perf_data:
                 atomic_performances[strategy_name] = CompositionPerformance(**perf_data)
         
+        # 提取新增的字段
+        equity_curves = comparison_result.get("equity_curves")
+        weight_distribution = comparison_result.get("weight_distribution")
+        signal_stats = comparison_result.get("signal_stats")
+        
         response = CompareCompositionResponse(
             success=True,
             message="组合类型比较完成",
             comparisons=comparisons,
             atomic_strategies=atomic_performances,
+            equity_curves=equity_curves,
+            weight_distribution=weight_distribution,
+            signal_stats=signal_stats,
             comparison_time=datetime.utcnow().isoformat()
         )
         

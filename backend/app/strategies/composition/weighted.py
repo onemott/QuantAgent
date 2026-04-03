@@ -5,7 +5,6 @@
 
 import logging
 import pandas as pd
-import numpy as np
 from typing import Dict, List, Any, Optional
 from .base import StrategyComposer
 
@@ -49,25 +48,40 @@ class WeightedComposer(StrategyComposer):
         if not self.weights:
             self.weights = {name: 1.0/len(atomic_signals) for name in atomic_signals.keys()}
         
-        # 确保所有权重策略都有信号
-        for strategy_name in self.weights.keys():
-            if strategy_name not in atomic_signals:
-                logger.warning(f"权重中指定的策略 {strategy_name} 没有信号，使用零信号")
-                atomic_signals[strategy_name] = pd.Series(0, index=df.index)
+        # 构建有效权重：只包含存在于 atomic_signals 中的策略
+        # 不修改原始 atomic_signals 字典
+        valid_weights = {}
+        missing_strategies = []
         
-        # 计算加权和
+        for strategy_name, weight in self.weights.items():
+            if strategy_name in atomic_signals:
+                valid_weights[strategy_name] = weight
+            else:
+                missing_strategies.append(strategy_name)
+                logger.warning(f"权重中指定的策略 {strategy_name} 不存在于信号中，已从有效权重中排除")
+        
+        # 检查是否存在有效权重
+        if not valid_weights:
+            logger.warning("没有有效的权重配置（所有权重指定的策略都不存在于信号中），返回全0信号")
+            return pd.Series(0, index=df.index)
+        
+        # 计算加权和，只使用有效的策略
         weighted_sum = pd.Series(0.0, index=df.index)
         total_weight = 0.0
         
         for strategy_name, signal in atomic_signals.items():
-            weight = self.weights.get(strategy_name, 0.0)
+            weight = valid_weights.get(strategy_name, 0.0)
             # 将信号 (-1,0,1) 转换为 (-1,0,1) * weight
             weighted_sum += signal * weight
             total_weight += abs(weight)
         
-        # 归一化 (可选)
-        if total_weight > 0:
-            weighted_sum = weighted_sum / total_weight
+        # 验证总权重有效性
+        if total_weight <= 0:
+            logger.warning(f"总权重为 {total_weight}，无法归一化，返回全0信号")
+            return pd.Series(0, index=df.index)
+        
+        # 归一化
+        weighted_sum = weighted_sum / total_weight
         
         # 通过阈值生成最终信号
         def _apply_threshold(x):
@@ -117,8 +131,7 @@ class WeightedComposer(StrategyComposer):
         """计算每个策略对组合信号的贡献度"""
         
         contributions = {}
-        signal_df = pd.DataFrame(atomic_signals)
-        
+
         for strategy_name, signal in atomic_signals.items():
             # 计算策略信号与组合信号的相关性
             correlation = signal.corr(combined_signal)

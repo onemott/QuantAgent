@@ -237,18 +237,39 @@ class BinanceService:
             logger.debug(f"ClickHouse kline persist skipped: {e}")
 
     async def get_klines_dataframe(
-        self, 
-        symbol: str = "BTC/USDT", 
-        timeframe: str = "1h", 
-        limit: int = 100
+        self,
+        symbol: str = "BTC/USDT",
+        timeframe: str = "1h",
+        limit: int = 100,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
     ) -> pd.DataFrame:
-        """异步获取 K 线数据并转换为 pandas DataFrame"""
+        """异步获取 K 线数据并转换为 pandas DataFrame
+        
+        Args:
+            symbol: 交易对，如 "BTC/USDT"
+            timeframe: K线周期，如 "1h", "1d"
+            limit: 获取的K线数量限制
+            start: 开始时间（可选），用于时间范围查询
+            end: 结束时间（可选），用于时间范围查询
+        """
         await self._ensure_initialized()
         symbol = self._normalize_symbol(symbol)
-        ohlcv = await self.public_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        
+        # 如果指定了时间范围，使用 since 参数从 Binance 获取数据
+        if start is not None:
+            since = int(start.timestamp() * 1000)  # 转换为毫秒时间戳
+            ohlcv = await self.public_exchange.fetch_ohlcv(
+                symbol, 
+                timeframe=timeframe, 
+                since=since,
+                limit=limit
+            )
+        else:
+            ohlcv = await self.public_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         
         df = pd.DataFrame(
-            ohlcv, 
+            ohlcv,
             columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
         )
         
@@ -261,6 +282,13 @@ class BinanceService:
         # 转换数值类型
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
+        
+        # 如果指定了结束时间，过滤数据
+        if end is not None:
+            # 将索引和比较值都转换为同一类型（numpy datetime64）
+            import numpy as np
+            end_np = np.datetime64(end)
+            df = df[df.index.values <= end_np]
         
         return df
 

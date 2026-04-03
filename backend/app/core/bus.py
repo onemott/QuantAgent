@@ -95,6 +95,11 @@ class TradingBus(ABC):
         """Stop the replay"""
         pass
 
+    @abstractmethod
+    async def get_balance(self) -> Dict[str, Any]:
+        """Get current account balance"""
+        pass
+
 
 class DataAdapter(ABC):
     """Abstract data adapter for both history and real-time"""
@@ -374,3 +379,7 @@ class TradingBusImpl(TradingBus):
         return await self.execution_router.execute(
             order_req, mode=self.mode.lower(), session_id=self.session_id
         )
+
+    async def get_balance(self) -> Dict[str, Any]:
+        """Get current account balance from paper trading service"""
+        return await paper_trading_service.get_balance(session_id=self.session_id)
