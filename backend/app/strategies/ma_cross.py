@@ -34,10 +34,32 @@ class MaCrossStrategy(BaseStrategy):
         if prev_fast_ma <= prev_slow_ma and fast_ma > slow_ma:
             if self.position == 0:
                 self.log(f"Golden Cross detected at {bar.close}, sending BUY order")
+                
+                # 全仓模式（与 SignalBasedStrategy 对齐）
+                # 如果用户显式设置了 quantity 且 > 0，使用固定数量；否则使用初始资金计算
+                fixed_qty = self.parameters.get("quantity", 0)
+                if fixed_qty and float(fixed_qty) > 0:
+                    quantity = float(fixed_qty)
+                else:
+                    balance_info = await self.bus.get_balance()
+                    available_capital = balance_info.get("available_balance", 0)
+                    if available_capital <= 0 or bar.close <= 0:
+                        return
+                        
+                    initial_capital = self.parameters.get("initial_capital", available_capital)
+                    use_capital = min(initial_capital, available_capital)
+                    
+                    commission_rate = 0.001    # 与 paper_trading_service FEE_RATE 对齐
+                    slippage_pct = 0.0005      # 与 paper_trading_service SLIPPAGE_PCT 对齐
+                    effective_price = bar.close * (1 + slippage_pct)
+                    quantity = use_capital / (effective_price * (1 + commission_rate))
+                    if quantity <= 0:
+                        return
+                
                 order_req = OrderRequest(
                     symbol=bar.symbol,
                     side=TradeSide.BUY,
-                    quantity=self.parameters.get("quantity", 0.01),
+                    quantity=quantity,
                     price=bar.close,
                     order_type=OrderType.MARKET,
                     strategy_id=self.strategy_id

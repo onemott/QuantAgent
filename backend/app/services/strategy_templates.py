@@ -18,6 +18,7 @@
   - basis       : 期现套利策略（异步，不支持历史回放）
 """
 
+import asyncio
 import logging
 import pandas as pd
 import numpy as np
@@ -40,8 +41,7 @@ _cache_initialized = False
 
 def _ma_cross_signal(df: pd.DataFrame, fast_period: int = 10, slow_period: int = 30) -> pd.Series:
     """均线金叉/死叉：金叉买入，死叉卖出。"""
-    result = df.copy()
-    result = sma(result, fast_period)
+    result = sma(df, fast_period)
     result = sma(result, slow_period)
     fast_col = f"sma_{fast_period}"
     slow_col = f"sma_{slow_period}"
@@ -66,7 +66,7 @@ def _rsi_signal(
     overbought: float = 70.0,
 ) -> pd.Series:
     """RSI 超买/超卖：低于超卖线买入，高于超买线卖出。"""
-    result = rsi(df.copy(), rsi_period)
+    result = rsi(df, rsi_period)
     col = f"rsi_{rsi_period}"
     rsi_vals = result[col]
 
@@ -89,7 +89,7 @@ def _boll_signal(
     sell_pct_b: float = 1.0,
 ) -> pd.Series:
     """布林带均值回归：触碰下轨买入，触碰上轨卖出。"""
-    result = bollinger_bands(df.copy(), period=period, std_dev=std_dev)
+    result = bollinger_bands(df, period=period, std_dev=std_dev)
     pct_b = result["boll_pct_b"]
 
     # 价格跌破下轨（%B <= 0）时买入
@@ -115,7 +115,7 @@ def _macd_signal(
     - 卖出：DIF 线下穿 DEA 信号线（死叉）
     结合 MACD 柱状图确认动量方向。
     """
-    result = macd(df.copy(), fast=fast, slow=slow, signal=signal_period)
+    result = macd(df, fast=fast, slow=slow, signal=signal_period)
     dif = result["macd_dif"]
     dea = result["macd_dea"]
 
@@ -142,8 +142,7 @@ def _ema_triple_signal(
     - 卖出：快线跌破中线（趋势破坏）
     通过三条 EMA 过滤噪音，追踪强趋势行情。
     """
-    result = df.copy()
-    result = ema(result, fast_period)
+    result = ema(df, fast_period)
     result = ema(result, mid_period)
     result = ema(result, slow_period)
 
@@ -177,7 +176,7 @@ def _atr_trend_signal(
     - 出场：价格跌破（近期最高价 - atr_multiplier × ATR）的动态止损线
     适合强趋势、高波动市场，可有效规避横盘震荡。
     """
-    result = atr(df.copy(), period=atr_period)
+    result = atr(df, period=atr_period)
     atr_vals   = result[f"atr_{atr_period}"]
     close      = result["close"]
     high       = result["high"]
@@ -191,17 +190,23 @@ def _atr_trend_signal(
     chandelier_stop = rolling_high - atr_multiplier * atr_vals
     exit_signal     = close < chandelier_stop
 
-    signals = pd.Series(0, index=df.index)
-    in_position = False
-    for i in range(len(signals)):
-        if not in_position and bool(breakout.iloc[i]):
-            signals.iloc[i] = 1   # 突破入场
-            in_position = True
-        elif in_position and bool(exit_signal.iloc[i]):
-            signals.iloc[i] = -1  # 吊灯止损出场
-            in_position = False
+    b_mask = breakout.fillna(False).to_numpy(dtype=bool)
+    x_mask = exit_signal.fillna(False).to_numpy(dtype=bool)
 
-    return signals
+    sig = np.zeros(len(df), dtype=np.int8)
+    position = 0
+
+    for i in range(len(df)):
+        if position == 0:
+            if b_mask[i]:
+                sig[i] = 1
+                position = 1
+        elif position == 1:
+            if x_mask[i]:
+                sig[i] = -1
+                position = 0
+
+    return pd.Series(sig, index=df.index)
 
 
 def _turtle_signal(
@@ -216,11 +221,11 @@ def _turtle_signal(
     使用唐奇安通道进行突破检测。
     """
     # 计算入场通道（上轨）
-    result = donchian_channels(df.copy(), period=entry_period)
+    result = donchian_channels(df, period=entry_period)
     upper_band = result["donchian_upper"]
     
     # 计算出场通道（下轨，使用不同周期）
-    exit_result = donchian_channels(df.copy(), period=exit_period)
+    exit_result = donchian_channels(df, period=exit_period)
     lower_band = exit_result["donchian_lower"]
     
     close = df["close"]
@@ -231,14 +236,8 @@ def _turtle_signal(
     exit_signal = (close < lower_band.shift(1))
     
     signals = pd.Series(0, index=df.index)
-    in_position = False
-    for i in range(len(signals)):
-        if not in_position and bool(buy_signal.iloc[i]):
-            signals.iloc[i] = 1   # 突破入场
-            in_position = True
-        elif in_position and bool(exit_signal.iloc[i]):
-            signals.iloc[i] = -1  # 跌破出场
-            in_position = False
+    signals[buy_signal] = 1   # 突破入场
+    signals[exit_signal] = -1  # 跌破出场
             
     return signals
 
@@ -255,7 +254,7 @@ def _ichimoku_trend_signal(
     - 出场：价格跌破基准线（趋势减弱）
     综合判断趋势强度和动量方向。
     """
-    result = ichimoku_cloud(df.copy(), tenkan_period, kijun_period, senkou_b_period)
+    result = ichimoku_cloud(df, tenkan_period, kijun_period, senkou_b_period)
     close  = result["close"]
     tenkan = result["ichi_tenkan"]  # 转折线
     kijun  = result["ichi_kijun"]   # 基准线
@@ -270,14 +269,8 @@ def _ichimoku_trend_signal(
     exit_signal = (close < kijun)  # 跌破基准线视为趋势减弱
     
     signals = pd.Series(0, index=df.index)
-    in_position = False
-    for i in range(len(signals)):
-        if not in_position and bool(buy_signal.iloc[i]):
-            signals.iloc[i] = 1   # 云层上方金叉买入
-            in_position = True
-        elif in_position and bool(exit_signal.iloc[i]):
-            signals.iloc[i] = -1  # 跌破基准线出场
-            in_position = False
+    signals[buy_signal] = 1   # 云层上方金叉买入
+    signals[exit_signal] = -1  # 跌破基准线出场
             
     return signals
 
@@ -1013,7 +1006,13 @@ def _safe_signal_wrapper(raw_func, validated: Dict[str, Any], is_async: bool = F
                 result = await raw_func(df, **validated)
                 return _sanitize_signal_result(result, df)
             except Exception as e:
-                logger.warning(f"异步信号函数异常: {type(e).__name__}: {e}，返回全 0 信号")
+                import traceback
+                logger.error(
+                    f"异步信号函数异常: {type(e).__name__}: {e}，返回全 0 信号\n"
+                    f"  策略参数: {validated}\n"
+                    f"  DataFrame shape: {df.shape if df is not None else 'None'}\n"
+                    f"  traceback:\n{traceback.format_exc()}"
+                )
                 return pd.Series(0, index=df.index if df is not None else pd.DatetimeIndex([]))
         return signal_func_async
     else:
@@ -1026,7 +1025,13 @@ def _safe_signal_wrapper(raw_func, validated: Dict[str, Any], is_async: bool = F
                 result = raw_func(df, **validated)
                 return _sanitize_signal_result(result, df)
             except Exception as e:
-                logger.warning(f"信号函数异常: {type(e).__name__}: {e}，返回全 0 信号")
+                import traceback
+                logger.error(
+                    f"信号函数异常: {type(e).__name__}: {e}，返回全 0 信号\n"
+                    f"  策略参数: {validated}\n"
+                    f"  DataFrame shape: {df.shape if df is not None else 'None'}\n"
+                    f"  traceback:\n{traceback.format_exc()}"
+                )
                 return pd.Series(0, index=df.index if df is not None else pd.DatetimeIndex([]))
         return signal_func_sync
 
@@ -1073,23 +1078,41 @@ def _sanitize_signal_result(result: Any, df: pd.DataFrame) -> pd.Series:
 
 def build_signal_func(strategy_type: str, params: Dict[str, Any]) -> Callable:
     """返回一个已绑定参数的信号函数 signal_func(df) -> pd.Series。"""
-    template = get_template(strategy_type)
-    raw_func = template["signal_func"]
+    import traceback
+    
+    try:
+        template = get_template(strategy_type)
+        raw_func = template["signal_func"]
 
-    # 校验并转换参数类型
-    validated = {}
-    for p in template["params"]:
-        key = p["key"]
-        val = params.get(key, p["default"])
-        if p["type"] == "int":
-            val = int(val)
-        elif p["type"] == "float":
-            val = float(val)
-        # str 类型保持原样
-        validated[key] = val
+        # 校验并转换参数类型
+        validated = {}
+        for p in template["params"]:
+            key = p["key"]
+            val = params.get(key, p["default"])
+            try:
+                if p["type"] == "int":
+                    val = int(val)
+                elif p["type"] == "float":
+                    val = float(val)
+                # str 类型保持原样
+                validated[key] = val
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    f"参数类型转换失败: {strategy_type}.{key}={val} (类型: {type(val).__name__}) "
+                    f"期望类型: {p['type']}, 错误: {e}\n{traceback.format_exc()}"
+                )
+                raise ValueError(
+                    f"参数 {key} 的值 '{val}' 无法转换为 {p['type']}"
+                ) from e
 
-    import inspect
-    is_async = inspect.iscoroutinefunction(raw_func)
+        import inspect
+        is_async = inspect.iscoroutinefunction(raw_func)
 
-    # 返回安全包装的信号函数
-    return _safe_signal_wrapper(raw_func, validated, is_async)
+        # 返回安全包装的信号函数
+        return _safe_signal_wrapper(raw_func, validated, is_async)
+    except Exception as e:
+        logger.error(
+            f"构建信号函数失败: strategy_type={strategy_type}, params={params}\n"
+            f"错误: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        )
+        raise

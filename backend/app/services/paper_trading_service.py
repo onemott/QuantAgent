@@ -334,7 +334,7 @@ class PaperTradingService:
         order_type: str = "MARKET",
         benchmark_price: Optional[float] = None,  # For TCA (Implementation Shortfall)
         client_order_id: Optional[str] = None,  # For idempotency
-        leverage: int = 1,  # Added leverage parameter
+        leverage: int = 1,  # Leverage for margin simulation / liquidation price
         strategy_id: Optional[str] = None,  # Added for attribution
         mode: str = "paper",  # paper | backtest | historical_replay
         session_id: Optional[str] = None,  # For historical_replay session_id
@@ -351,6 +351,9 @@ class PaperTradingService:
             raise ValueError("Quantity must be positive")
         if price <= 0:
             raise ValueError("Price must be positive")
+        if leverage is None or int(leverage) <= 0:
+            raise ValueError("Leverage must be a positive integer")
+        leverage = int(leverage)
 
         # Get current time for all records
         now = self._get_current_time()
@@ -404,19 +407,69 @@ class PaperTradingService:
             p["quantity"] * p["mark_price"] for p in positions_data
         )
 
-        risk_result = await risk_manager.check_order(
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            price=price,
-            current_balance=available_balance,
-            current_positions=current_positions,
-            total_portfolio_value=total_portfolio,
-            market_price=price,
-            leverage=leverage,
-        )
-        if not risk_result.allowed:
-            raise ValueError(f"[风控拦截] {risk_result.reason}")
+        # ── 核心兜底风控：名义价值绝对上限 ──────────────────────────────────────
+        qty_dec = Decimal(str(quantity))
+        price_dec = Decimal(str(price))
+        
+        # 名义价值 = 数量 * 价格
+        notional_value = qty_dec * price_dec
+        
+        # 1. 绝对上限拦截：单笔订单名义价值不能超过总资产的 100%（容忍一点点滑点误差）
+        # 这里我们使用 total_portfolio 的 1.05 倍作为硬性物理拦截线
+        max_notional_allowed = Decimal(str(total_portfolio)) * Decimal("1.05")
+        
+        if notional_value > max_notional_allowed:
+            raise ValueError(
+                f"[核心风控拦截] 订单名义价值过大！"
+                f"请求名义价值: ${notional_value:.2f}, "
+                f"当前总资产: ${Decimal(str(total_portfolio)):.2f}。"
+                f"可能存在数量单位错误（如把 USDT 当成币种数量传入）。"
+            )
+
+        # 历史回放模式下跳过复杂风控检查（如宏观风险、单仓上限等），以保证回测逻辑顺利执行
+        if mode != "historical_replay":
+            risk_result = await risk_manager.check_order(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price=price,
+                current_balance=available_balance,
+                current_positions=current_positions,
+                total_portfolio_value=total_portfolio,
+                market_price=price,
+                leverage=leverage,
+            )
+            if not risk_result.allowed:
+                raise ValueError(f"[风控拦截] {risk_result.reason}")
+        else:
+            # 仅做最基本的可用资金检查
+            qty_dec = Decimal(str(quantity))
+            price_dec = Decimal(str(price))
+            
+            # 判断是否为开仓/加仓操作
+            current_qty = Decimal(str(current_positions.get(symbol, 0)))
+            open_qty = Decimal("0")
+            
+            if side == "BUY":
+                if current_qty >= 0:
+                    open_qty = qty_dec
+                elif qty_dec > abs(current_qty):
+                    open_qty = qty_dec - abs(current_qty)
+            elif side == "SELL":
+                if current_qty <= 0:
+                    open_qty = qty_dec
+                elif qty_dec > current_qty:
+                    open_qty = qty_dec - current_qty
+                    
+            if open_qty > 0:
+                margin_required = open_qty * price_dec / Decimal(str(leverage))
+                fee_est = qty_dec * price_dec * FEE_RATE
+                total_cost = margin_required + fee_est
+                avail_dec = Decimal(str(available_balance))
+                if avail_dec < total_cost:
+                    # 容忍 0.01 的浮点数舍入误差
+                    if total_cost - avail_dec > Decimal("0.01"):
+                        raise ValueError(f"[资金不足] {side} 需 ${total_cost:.2f}，可用 ${avail_dec:.2f}")
         # ──────────────────────────────────────────────────────────────────
 
         qty_dec = Decimal(str(quantity))
@@ -434,6 +487,7 @@ class PaperTradingService:
                     order_type="LIMIT",
                     quantity=qty_dec,
                     price=price_dec,
+                    leverage=leverage,
                     benchmark_price=Decimal(str(benchmark_price)),
                     fee=fee,
                     pnl=None,
@@ -496,6 +550,7 @@ class PaperTradingService:
                 order_type=order_type,
                 quantity=qty_dec,
                 price=price_dec,
+                leverage=leverage,
                 benchmark_price=Decimal(str(benchmark_price)),
                 fee=fee,
                 pnl=pnl_record,
@@ -619,7 +674,7 @@ class PaperTradingService:
         qty_dec: Decimal,
         price_dec: Decimal,
         fee: Decimal,
-        leverage: int = 1,
+        leverage: Optional[int] = None,
         strategy_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -638,7 +693,8 @@ class PaperTradingService:
         # Current Position State
         curr_qty = position.quantity if position else Decimal(0)
         curr_avg = position.avg_price if position else Decimal(0)
-        curr_lev = position.leverage if position else 1
+        curr_lev = int(position.leverage) if position and position.leverage else 1
+        eff_lev = int(leverage) if leverage is not None else curr_lev
 
         # Determine Delta
         delta_qty = qty_dec if side == "BUY" else -qty_dec
@@ -652,8 +708,7 @@ class PaperTradingService:
                 # Opening / Adding
                 total_val = (curr_qty * curr_avg) + (delta_qty * price_dec)
                 new_avg = total_val / new_qty
-                # Use the new leverage for the whole position if it's different
-                new_lev = leverage
+                new_lev = eff_lev
             else:
                 # Closing / Reducing
                 new_avg = curr_avg
@@ -663,7 +718,7 @@ class PaperTradingService:
             # Flip Position
             realized_pnl = (price_dec - curr_avg) * curr_qty
             new_avg = price_dec
-            new_lev = leverage
+            new_lev = eff_lev
 
         # Calculate new liquidation price
         liq_price = None
@@ -762,6 +817,7 @@ class PaperTradingService:
                         qty_dec,
                         price_dec,
                         fee,
+                        leverage=order.leverage,
                         strategy_id=order.strategy_id,
                     )
 
@@ -874,6 +930,9 @@ class PaperTradingService:
             session_id: If provided, limits matching to this replay session's orders
         """
         now = self._get_current_time()
+        # If no session_id (e.g. test/backtest without DB), skip order matching
+        if not session_id:
+            return
         async with get_db() as session:
             # Only match orders for symbols present in the current bar
             symbols = list(bar_prices.keys())
@@ -930,7 +989,7 @@ class PaperTradingService:
                         qty_dec=qty_dec,
                         price_dec=exec_price,
                         fee=fee,
-                        leverage=1,
+                        leverage=order.leverage,
                         strategy_id=order.strategy_id,
                         session_id=session_id,
                     )

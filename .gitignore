@@ -1,10 +1,16 @@
 # ── Secrets & Environment ─────────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
 .env.local
 .env.production
 Private_key.pem
 *.pem
 *.key
+
+# ── Local-only docs ───────────────────────────────────────────────────────────
+/AGENTS.md
+/README.md
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
@@ -18,6 +24,14 @@ env/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.cache/
+.tox/
+.nox/
+.ipynb_checkpoints/
+.coverage
+coverage.xml
+htmlcov/
 
 # ── Node / Next.js ────────────────────────────────────────────────────────────
 node_modules/
@@ -25,10 +39,12 @@ npm-debug.log*
 yarn-error.log
 .next/
 .package.json.md5
+**/*.tsbuildinfo
 
 # ── Build outputs ─────────────────────────────────────────────────────────────
 dist/
 build/
+logs/
 
 # ── IDE & OS ──────────────────────────────────────────────────────────────────
 .idea/
@@ -36,6 +52,7 @@ build/
 .claude/
 .qoder/
 .workbuddy/
+.trae/
 *.swp
 *.swo
 .DS_Store
@@ -48,19 +65,20 @@ nul
 
 # ── Compiled binaries ─────────────────────────────────────────────────────────
 gateway/main.exe
+gateway/main
+gateway/*.test
+coverage.out
 
-# ── Docs & specs (not needed for running the project) ─────────────────────────
-docs/
-specs实施方案/
-*.txt
+# ── Local smoke tests (keep real tests under tests/ or backend/tests/) ──────────
+/test_*.py
+backend/test_*.py
+backend/scripts/test_*.py
+scripts/test_*.py
 
-# ── One-off scripts & debug files ─────────────────────────────────────────────
-scripts/
-backend/scripts/
-tests/
-backend/tests/
-test_*.py
 verify_*.py
+
+/prompt*.txt
+*prompt*.txt
 
 # ── Misc project-local files ──────────────────────────────────────────────────
 review_*.txt
@@ -76,9 +94,18 @@ prompt认知.txt
 策略组合功能实现文档.md
 backend/backend/
 
+# ── Research reports (local only, never push to GitHub) ─────────────────────
+research_report_*.md
+research_plan_*.md
+
 # ── Backup & temp files ──────────────────────────────────────────────────────
 *.backup
 *.bak
 *.tmp
 fix_*.js
 fix_*.py
+
+# ── Local Docs & Specs ──
+docs/
+specs*/
+

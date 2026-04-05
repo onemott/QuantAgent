@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, List
@@ -27,6 +28,8 @@ from app.services.strategy_runner_service import strategy_runner_service
 from app.services.paper_trading_service import paper_trading_service
 from app.strategies.ma_cross import MaCrossStrategy
 from app.strategies.signal_based_strategy import SignalBasedStrategy
+from app.services.indicators import ema as calc_ema_df, atr as calc_atr_df, donchian_channels as calc_donchian_df, ichimoku_cloud as calc_ichimoku_df
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -73,6 +76,16 @@ def safe_float(val, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+DEFAULT_INITIAL_CAPITAL = 100000.0
+
+
+def safe_finite_float(val, default: float = 0.0) -> float:
+    f = safe_float(val, default=default)
+    if not math.isfinite(f):
+        return default
+    return f
 
 
 # =============================================================================
@@ -158,9 +171,27 @@ def calc_macd(closes: list[float], fast: int = 12, slow: int = 26, signal_period
     return macd_line, signal, histogram
 
 
-def compute_indicators(closes: list[float], times: list[str], strategy_type: str, params: dict) -> dict[str, list[IndicatorData]]:
+def compute_indicators(closes: list[float], times: list[str], strategy_type: str, params: dict, highs: list[float] = None, lows: list[float] = None) -> dict[str, list[IndicatorData]]:
     """Compute technical indicators based on strategy type and params."""
     indicators = {}
+
+    def _add_value(values: dict, key: str, val, ndigits: int):
+        if not isinstance(values, dict):
+            return
+        if val is None:
+            return
+        try:
+            if pd.isna(val):
+                return
+        except Exception:
+            pass
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(fval):
+            return
+        values[key] = round(fval, ndigits)
     
     if strategy_type == "ma":
         ma_short_period = params.get("ma_short", params.get("short_period", 10))
@@ -170,11 +201,12 @@ def compute_indicators(closes: list[float], times: list[str], strategy_type: str
         
         indicators["ma"] = []
         for i, t in enumerate(times):
+            if i >= len(ma_short) or i >= len(ma_long):
+                continue
             values = {}
-            if ma_short[i] is not None:
-                values["ma_short"] = round(ma_short[i], 2)
-            if ma_long[i] is not None:
-                values["ma_long"] = round(ma_long[i], 2)
+            # 兼容 None/NaN（回放数据可能含缺失值或计算窗口含 NaN）
+            _add_value(values, "ma_short", ma_short[i], 2)
+            _add_value(values, "ma_long", ma_long[i], 2)
             if values:
                 indicators["ma"].append(IndicatorData(time=t, values=values))
     
@@ -184,8 +216,12 @@ def compute_indicators(closes: list[float], times: list[str], strategy_type: str
         
         indicators["rsi"] = []
         for i, t in enumerate(times):
-            if rsi[i] is not None:
-                indicators["rsi"].append(IndicatorData(time=t, values={"rsi": round(rsi[i], 2)}))
+            if i >= len(rsi):
+                continue
+            values = {}
+            _add_value(values, "rsi", rsi[i], 2)
+            if values:
+                indicators["rsi"].append(IndicatorData(time=t, values=values))
     
     elif strategy_type == "boll":
         period = params.get("boll_period", params.get("period", 20))
@@ -194,13 +230,12 @@ def compute_indicators(closes: list[float], times: list[str], strategy_type: str
         
         indicators["boll"] = []
         for i, t in enumerate(times):
+            if i >= len(upper) or i >= len(middle) or i >= len(lower):
+                continue
             values = {}
-            if upper[i] is not None:
-                values["upper"] = round(upper[i], 2)
-            if middle[i] is not None:
-                values["middle"] = round(middle[i], 2)
-            if lower[i] is not None:
-                values["lower"] = round(lower[i], 2)
+            _add_value(values, "upper", upper[i], 2)
+            _add_value(values, "middle", middle[i], 2)
+            _add_value(values, "lower", lower[i], 2)
             if values:
                 indicators["boll"].append(IndicatorData(time=t, values=values))
     
@@ -212,15 +247,112 @@ def compute_indicators(closes: list[float], times: list[str], strategy_type: str
         
         indicators["macd"] = []
         for i, t in enumerate(times):
+            if i >= len(macd_line) or i >= len(signal_line) or i >= len(histogram):
+                continue
             values = {}
-            if macd_line[i] is not None:
-                values["macd"] = round(macd_line[i], 4)
-            if signal_line[i] is not None:
-                values["signal"] = round(signal_line[i], 4)
-            if histogram[i] is not None:
-                values["histogram"] = round(histogram[i], 4)
+            _add_value(values, "macd", macd_line[i], 4)
+            _add_value(values, "signal", signal_line[i], 4)
+            _add_value(values, "histogram", histogram[i], 4)
             if values:
                 indicators["macd"].append(IndicatorData(time=t, values=values))
+    
+    elif strategy_type == "ema_triple":
+        fast_period = int(params.get("fast_period", 5))
+        mid_period = int(params.get("mid_period", 20))
+        slow_period = int(params.get("slow_period", 60))
+        
+        df = pd.DataFrame({"close": closes})
+        df = calc_ema_df(df, fast_period)
+        df = calc_ema_df(df, mid_period)
+        df = calc_ema_df(df, slow_period)
+        
+        indicators["ema"] = []
+        for i, t in enumerate(times):
+            if i >= len(df):
+                continue
+            values = {}
+            v_fast = df[f"ema_{fast_period}"].iloc[i]
+            v_mid = df[f"ema_{mid_period}"].iloc[i]
+            v_slow = df[f"ema_{slow_period}"].iloc[i]
+            if pd.notna(v_fast):
+                values["ema_fast"] = round(float(v_fast), 2)
+            if pd.notna(v_mid):
+                values["ema_mid"] = round(float(v_mid), 2)
+            if pd.notna(v_slow):
+                values["ema_slow"] = round(float(v_slow), 2)
+            if values:
+                indicators["ema"].append(IndicatorData(time=t, values=values))
+    
+    elif strategy_type == "atr_trend":
+        atr_period = int(params.get("atr_period", 14))
+        atr_multiplier = float(params.get("atr_multiplier", 2.0))
+        trend_period = int(params.get("trend_period", 20))
+        
+        df = pd.DataFrame({"close": closes, "high": highs or closes, "low": lows or closes})
+        df = calc_atr_df(df, atr_period)
+        
+        rolling_high = df["high"].rolling(window=atr_period).max()
+        chandelier_stop = rolling_high - atr_multiplier * df[f"atr_{atr_period}"]
+        trend_highest = df["high"].rolling(window=trend_period).max()
+        
+        indicators["atr"] = []
+        for i, t in enumerate(times):
+            if i >= len(df) or i >= len(chandelier_stop) or i >= len(trend_highest):
+                continue
+            values = {}
+            atr_val = df[f"atr_{atr_period}"].iloc[i]
+            stop_val = chandelier_stop.iloc[i]
+            high_val = trend_highest.iloc[i]
+            if pd.notna(atr_val):
+                values["atr"] = round(float(atr_val), 2)
+            if pd.notna(stop_val):
+                values["chandelier_stop"] = round(float(stop_val), 2)
+            if pd.notna(high_val):
+                values["highest"] = round(float(high_val), 2)
+            if values:
+                indicators["atr"].append(IndicatorData(time=t, values=values))
+    
+    elif strategy_type == "turtle":
+        entry_period = int(params.get("entry_period", 20))
+        exit_period = int(params.get("exit_period", 10))
+        
+        df = pd.DataFrame({"close": closes, "high": highs or closes, "low": lows or closes})
+        entry_result = calc_donchian_df(df, entry_period)
+        exit_result = calc_donchian_df(df, exit_period)
+        
+        indicators["turtle"] = []
+        for i, t in enumerate(times):
+            if i >= len(entry_result) or i >= len(exit_result):
+                continue
+            values = {}
+            upper_val = entry_result["donchian_upper"].iloc[i]
+            lower_val = exit_result["donchian_lower"].iloc[i]
+            if pd.notna(upper_val):
+                values["upper"] = round(float(upper_val), 2)
+            if pd.notna(lower_val):
+                values["lower"] = round(float(lower_val), 2)
+            if values:
+                indicators["turtle"].append(IndicatorData(time=t, values=values))
+    
+    elif strategy_type == "ichimoku":
+        tenkan_period = int(params.get("tenkan_period", 9))
+        kijun_period = int(params.get("kijun_period", 26))
+        senkou_b_period = int(params.get("senkou_b_period", 52))
+        
+        df = pd.DataFrame({"close": closes, "high": highs or closes, "low": lows or closes})
+        result = calc_ichimoku_df(df, tenkan_period, kijun_period, senkou_b_period)
+        
+        indicators["ichimoku"] = []
+        for i, t in enumerate(times):
+            if i >= len(result):
+                continue
+            values = {}
+            for col, key in [("ichi_tenkan", "tenkan"), ("ichi_kijun", "kijun"), ("ichi_span_a", "span_a"), ("ichi_span_b", "span_b")]:
+                val = result[col].iloc[i]
+                if pd.notna(val):
+                    values[key] = round(float(val), 2)
+            if values:
+                indicators["ichimoku"].append(IndicatorData(time=t, values=values))
     
     return indicators
 
@@ -387,6 +519,8 @@ async def start_replay(
         strategy_id_val = session.strategy_id
         strategy_type_val = session.strategy_type or "ma"
         strategy_params = session.params or {}
+        # Ensure initial_capital is passed to strategy params so it can be used for position sizing
+        strategy_params["initial_capital"] = safe_finite_float(session.initial_capital, DEFAULT_INITIAL_CAPITAL)
         symbol_val = session.symbol
         end_time_val = session.end_time
         # Get interval from params (default to 1m)
@@ -399,7 +533,7 @@ async def start_replay(
                 
                 # Reset paper trading service to clean state with session's initial capital
                 await paper_trading_service.reset_session(
-                    initial_capital=float(session.initial_capital) if session.initial_capital else 100000.0,
+                    initial_capital=safe_finite_float(session.initial_capital, DEFAULT_INITIAL_CAPITAL),
                     session_id=replay_session_id
                 )
 
@@ -416,7 +550,11 @@ async def start_replay(
                 else:
                     strategy = strategy_cls(strategy_id=str(strategy_id_val), bus=bus)
                 strategy.set_parameters(strategy_params)
-                logger.info(f"Strategy {strategy_type_val} initialized with params: {strategy_params}")
+                logger.info(
+                    f"Strategy {strategy_type_val} initialized: "
+                    f"params={strategy_params}, "
+                    f"signal_func={'OK' if getattr(strategy, '_signal_func', None) is not None else 'NONE (WARNING!)'}"
+                )
                 
                 # Subscribe the strategy to the bus with specified interval
                 logger.info(f"Subscribing to data for {symbol_val} on {interval_val}")
@@ -426,7 +564,24 @@ async def start_replay(
                 # Start playback
                 logger.info("Starting playback...")
                 await adapter.start_playback()
-                logger.info("Playback started successfully")
+                
+                # Log signal statistics from strategy
+                if hasattr(strategy, '_total_bars_processed'):
+                    logger.info(
+                        f"Replay signal summary for {replay_session_id}: "
+                        f"bars_processed={strategy._total_bars_processed}, "
+                        f"buy_signals={strategy._total_buy_signals}, "
+                        f"sell_signals={strategy._total_sell_signals}, "
+                        f"signal_errors={strategy._signal_errors}"
+                    )
+                    if strategy._total_buy_signals == 0 and strategy._total_sell_signals == 0:
+                        logger.warning(
+                            f"⚠️ 回放 {replay_session_id} 零信号! "
+                            f"策略类型={strategy_type_val}, 参数={strategy_params}, "
+                            f"处理K线数={strategy._total_bars_processed}, 错误数={strategy._signal_errors}"
+                        )
+                
+                logger.info("Playback completed successfully")
                 
                 # Update status to completed
                 async with get_db() as session_db:
@@ -556,7 +711,7 @@ async def list_replay_sessions(
                 pass
             
             # Build summary metrics
-            initial_cap = float(s.initial_capital) if s.initial_capital else 100000.0
+            initial_cap = safe_finite_float(s.initial_capital, DEFAULT_INITIAL_CAPITAL)
             final_equity = initial_cap + pnl
             total_return = (pnl / initial_cap * 100) if initial_cap > 0 else 0.0
             
@@ -957,7 +1112,7 @@ async def get_replay_trade_stats(
         max_loss = max(losses) if losses else 0.0
         
         # Calculate final equity and returns
-        initial_capital = float(session.initial_capital) if session.initial_capital else 100000.0
+        initial_capital = safe_finite_float(session.initial_capital, DEFAULT_INITIAL_CAPITAL)
         final_equity = initial_capital + total_pnl
         returns_pct = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0.0
         
@@ -1124,7 +1279,7 @@ async def quick_backtest_from_session(
         interval = params.get("interval", "1m")
         start_time = session.start_time
         end_time = session.end_time
-        initial_capital = float(session.initial_capital) if session.initial_capital else 100000.0
+        initial_capital = safe_finite_float(session.initial_capital, DEFAULT_INITIAL_CAPITAL)
         
         # Keep interval in params for comparison purposes (it's important for replay-backtest comparison)
         # Note: interval is also stored separately in BacktestResult.interval field
@@ -1393,7 +1548,7 @@ async def get_replay_equity_curve(
         if not session:
             raise HTTPException(status_code=404, detail="Replay session not found")
         
-        initial_capital = float(session.initial_capital) if session.initial_capital else 100000.0
+        initial_capital = safe_finite_float(session.initial_capital, DEFAULT_INITIAL_CAPITAL)
         params = session.params or {}
         interval = params.get("interval", "1m")
         
@@ -1413,7 +1568,7 @@ async def get_replay_equity_curve(
                 ts = snap.timestamp.isoformat() if snap.timestamp else ""
                 equity_curve.append({
                     "t": ts,
-                    "v": float(snap.total_equity) if snap.total_equity else initial_capital
+                    "v": safe_finite_float(snap.total_equity, initial_capital)
                 })
                 if snap.timestamp:
                     equity_timestamps.append(snap.timestamp)
@@ -1630,6 +1785,8 @@ async def get_replay_klines(
         klines = []
         times = []
         closes = []
+        highs = []
+        lows = []
         
         for idx in df.index:
             row = df.loc[idx]
@@ -1644,9 +1801,11 @@ async def get_replay_klines(
             ))
             times.append(time_str)
             closes.append(safe_float(row['close']))
+            highs.append(safe_float(row['high']))
+            lows.append(safe_float(row['low']))
         
         # 5. Compute technical indicators based on strategy type
-        indicators = compute_indicators(closes, times, strategy_type, params)
+        indicators = compute_indicators(closes, times, strategy_type, params, highs=highs, lows=lows)
         
         return ReplayKlineResponse(
             klines=klines,
@@ -1716,6 +1875,9 @@ async def get_replay_position(
                         net_quantity = remaining
                         total_cost = remaining * price
                     else:
+                        # Reduce short
+                        ratio = (abs(net_quantity) - qty) / abs(net_quantity) if abs(net_quantity) > 0 else 0
+                        total_cost *= ratio
                         net_quantity += qty
             elif trade.side == "SELL":
                 # Reduce or reverse position

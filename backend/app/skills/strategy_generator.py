@@ -793,10 +793,17 @@ class TrendFollowingStrategy(BaseStrategy):
                 price_change_pct = (fast_ma - slow_ma) / slow_ma
                 if price_change_pct >= {entry_threshold}:
                     self.log(f"金叉信号触发，快MA={{fast_ma:.2f}}, 慢MA={{slow_ma:.2f}}")
+                    
+                    # 获取当前可用资金并计算买入数量
+                    balance_info = await self.bus.get_balance()
+                    available_capital = balance_info.get("available_balance", 0)
+                    invest_amount = available_capital * {position_size}
+                    quantity = invest_amount / bar.close
+                    
                     order_req = OrderRequest(
                         symbol=bar.symbol,
                         side=TradeSide.BUY,
-                        quantity={position_size},
+                        quantity=quantity,
                         price=bar.close,
                         order_type=OrderType.MARKET,
                         strategy_id=self.strategy_id
@@ -893,10 +900,17 @@ class MeanReversionStrategy(BaseStrategy):
         # 买入信号：RSI低于超卖线
         if rsi < {oversold} and self.position == 0:
             self.log(f"RSI超卖买入信号，RSI={{rsi:.2f}}")
+            
+            # 获取当前可用资金并计算买入数量
+            balance_info = await self.bus.get_balance()
+            available_capital = balance_info.get("available_balance", 0)
+            invest_amount = available_capital * {position_size}
+            quantity = invest_amount / bar.close
+            
             order_req = OrderRequest(
                 symbol=bar.symbol,
                 side=TradeSide.BUY,
-                quantity={position_size},
+                quantity=quantity,
                 price=bar.close,
                 order_type=OrderType.MARKET,
                 strategy_id=self.strategy_id
@@ -1001,10 +1015,17 @@ class BreakoutStrategy(BaseStrategy):
         # 买入信号：价格突破上轨
         if bar.close > upper and prev_close <= upper and self.position == 0:
             self.log(f"突破上轨买入，价格={{bar.close:.2f}}, 上轨={{upper:.2f}}")
+            
+            # 获取当前可用资金并计算买入数量
+            balance_info = await self.bus.get_balance()
+            available_capital = balance_info.get("available_balance", 0)
+            invest_amount = available_capital * {position_size}
+            quantity = invest_amount / bar.close
+            
             order_req = OrderRequest(
                 symbol=bar.symbol,
                 side=TradeSide.BUY,
-                quantity={position_size},
+                quantity=quantity,
                 price=bar.close,
                 order_type=OrderType.MARKET,
                 strategy_id=self.strategy_id
@@ -1108,10 +1129,17 @@ class MomentumStrategy(BaseStrategy):
         # 买入信号：MACD金叉
         if prev_dif <= prev_dea and dif > dea and self.position == 0:
             self.log(f"MACD金叉买入，DIF={{dif:.4f}}, DEA={{dea:.4f}}")
+            
+            # 获取当前可用资金并计算买入数量
+            balance_info = await self.bus.get_balance()
+            available_capital = balance_info.get("available_balance", 0)
+            invest_amount = available_capital * {position_size}
+            quantity = invest_amount / bar.close
+            
             order_req = OrderRequest(
                 symbol=bar.symbol,
                 side=TradeSide.BUY,
-                quantity={position_size},
+                quantity=quantity,
                 price=bar.close,
                 order_type=OrderType.MARKET,
                 strategy_id=self.strategy_id

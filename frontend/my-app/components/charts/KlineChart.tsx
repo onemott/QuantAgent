@@ -103,6 +103,21 @@ const COLORS = {
   macdHistNeg: "#ef4444",
   buyMarker: "#22c55e",
   sellMarker: "#ef4444",
+  // EMA Triple
+  emaFast: "#eab308",
+  emaMid: "#3b82f6",
+  emaSlow: "#a855f7",
+  // ATR Trend
+  atrStop: "#ef4444",
+  atrHighest: "#22c55e",
+  // Turtle
+  turtleUpper: "#38bdf8",
+  turtleLower: "#f97316",
+  // Ichimoku
+  ichiTenkan: "#ef4444",
+  ichiKijun: "#3b82f6",
+  ichiSpanA: "#22c55e",
+  ichiSpanB: "#f97316",
 };
 
 // ─── KlineChart Component ─────────────────────────────────────────────────────
@@ -131,6 +146,21 @@ export default function KlineChart({
   const macdLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const macdSignalRef = useRef<ISeriesApi<"Line"> | null>(null);
   const macdHistRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  // EMA Triple refs
+  const emaFastRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const emaMidRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const emaSlowRef = useRef<ISeriesApi<"Line"> | null>(null);
+  // ATR Trend refs
+  const atrStopRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const atrHighestRef = useRef<ISeriesApi<"Line"> | null>(null);
+  // Turtle refs
+  const turtleUpperRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const turtleLowerRef = useRef<ISeriesApi<"Line"> | null>(null);
+  // Ichimoku refs
+  const ichiTenkanRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ichiKijunRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ichiSpanARef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ichiSpanBRef = useRef<ISeriesApi<"Line"> | null>(null);
 
   const prevKlineCountRef = useRef(0);
 
@@ -138,6 +168,10 @@ export default function KlineChart({
   const showBOLL = strategyType.toLowerCase() === "boll";
   const showRSI = strategyType.toLowerCase() === "rsi";
   const showMACD = strategyType.toLowerCase() === "macd";
+  const showEMA = strategyType.toLowerCase() === "ema_triple";
+  const showATR = strategyType.toLowerCase() === "atr_trend";
+  const showTURTLE = strategyType.toLowerCase() === "turtle";
+  const showICHIMOKU = strategyType.toLowerCase() === "ichimoku";
 
   // ─── Initialize Charts ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -227,6 +261,44 @@ export default function KlineChart({
       bollUpperRef.current = bollUpper;
       bollMiddleRef.current = bollMiddle;
       bollLowerRef.current = bollLower;
+    }
+
+    // Add EMA Triple indicator lines if needed
+    if (showEMA) {
+      const ef = mainChart.addSeries(LineSeries, { color: COLORS.emaFast, lineWidth: 1, priceLineVisible: false, title: "EMA快" });
+      const em = mainChart.addSeries(LineSeries, { color: COLORS.emaMid, lineWidth: 1, priceLineVisible: false, title: "EMA中" });
+      const es = mainChart.addSeries(LineSeries, { color: COLORS.emaSlow, lineWidth: 1, priceLineVisible: false, title: "EMA慢" });
+      emaFastRef.current = ef;
+      emaMidRef.current = em;
+      emaSlowRef.current = es;
+    }
+
+    // Add ATR Trend indicator lines if needed
+    if (showATR) {
+      const stop = mainChart.addSeries(LineSeries, { color: COLORS.atrStop, lineWidth: 1, lineStyle: 2, priceLineVisible: false, title: "止损线" });
+      const highest = mainChart.addSeries(LineSeries, { color: COLORS.atrHighest, lineWidth: 1, lineStyle: 2, priceLineVisible: false, title: "趋势线" });
+      atrStopRef.current = stop;
+      atrHighestRef.current = highest;
+    }
+
+    // Add Turtle indicator lines if needed
+    if (showTURTLE) {
+      const upper = mainChart.addSeries(LineSeries, { color: COLORS.turtleUpper, lineWidth: 1, priceLineVisible: false, title: "入场上轨" });
+      const lower = mainChart.addSeries(LineSeries, { color: COLORS.turtleLower, lineWidth: 1, priceLineVisible: false, title: "出场下轨" });
+      turtleUpperRef.current = upper;
+      turtleLowerRef.current = lower;
+    }
+
+    // Add Ichimoku indicator lines if needed
+    if (showICHIMOKU) {
+      const tenkan = mainChart.addSeries(LineSeries, { color: COLORS.ichiTenkan, lineWidth: 1, priceLineVisible: false, title: "转折线" });
+      const kijun = mainChart.addSeries(LineSeries, { color: COLORS.ichiKijun, lineWidth: 1, priceLineVisible: false, title: "基准线" });
+      const spanA = mainChart.addSeries(LineSeries, { color: COLORS.ichiSpanA, lineWidth: 1, lineStyle: 2, priceLineVisible: false, title: "先行A" });
+      const spanB = mainChart.addSeries(LineSeries, { color: COLORS.ichiSpanB, lineWidth: 1, lineStyle: 2, priceLineVisible: false, title: "先行B" });
+      ichiTenkanRef.current = tenkan;
+      ichiKijunRef.current = kijun;
+      ichiSpanARef.current = spanA;
+      ichiSpanBRef.current = spanB;
     }
 
     // Create RSI sub-chart if needed
@@ -322,6 +394,17 @@ export default function KlineChart({
       bollUpperRef.current = null;
       bollMiddleRef.current = null;
       bollLowerRef.current = null;
+      emaFastRef.current = null;
+      emaMidRef.current = null;
+      emaSlowRef.current = null;
+      atrStopRef.current = null;
+      atrHighestRef.current = null;
+      turtleUpperRef.current = null;
+      turtleLowerRef.current = null;
+      ichiTenkanRef.current = null;
+      ichiKijunRef.current = null;
+      ichiSpanARef.current = null;
+      ichiSpanBRef.current = null;
 
       if (rsiChartRef.current) {
         rsiChartRef.current.remove();
@@ -337,7 +420,7 @@ export default function KlineChart({
         macdHistRef.current = null;
       }
     };
-  }, [showMA, showBOLL, showRSI, showMACD]);
+  }, [showMA, showBOLL, showRSI, showMACD, showEMA, showATR, showTURTLE, showICHIMOKU]);
 
   // ─── Update Kline Data ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -468,6 +551,111 @@ export default function KlineChart({
     macdChartRef.current?.timeScale().fitContent();
   }, [indicators, showMACD]);
 
+  // ─── Update EMA Triple Indicators ───────────────────────────────────────────
+  useEffect(() => {
+    if (!showEMA || !indicators.ema) return;
+
+    const emaData = indicators.ema;
+
+    if (emaFastRef.current) {
+      const raw = emaData
+        .filter((p) => p.values.ema_fast != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.ema_fast }));
+      emaFastRef.current.setData(prepareChartData(raw));
+    }
+
+    if (emaMidRef.current) {
+      const raw = emaData
+        .filter((p) => p.values.ema_mid != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.ema_mid }));
+      emaMidRef.current.setData(prepareChartData(raw));
+    }
+
+    if (emaSlowRef.current) {
+      const raw = emaData
+        .filter((p) => p.values.ema_slow != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.ema_slow }));
+      emaSlowRef.current.setData(prepareChartData(raw));
+    }
+  }, [indicators, showEMA]);
+
+  // ─── Update ATR Trend Indicators ────────────────────────────────────────────
+  useEffect(() => {
+    if (!showATR || !indicators.atr) return;
+
+    const atrData = indicators.atr;
+
+    if (atrStopRef.current) {
+      const raw = atrData
+        .filter((p) => p.values.chandelier_stop != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.chandelier_stop }));
+      atrStopRef.current.setData(prepareChartData(raw));
+    }
+
+    if (atrHighestRef.current) {
+      const raw = atrData
+        .filter((p) => p.values.highest != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.highest }));
+      atrHighestRef.current.setData(prepareChartData(raw));
+    }
+  }, [indicators, showATR]);
+
+  // ─── Update Turtle Indicators ───────────────────────────────────────────────
+  useEffect(() => {
+    if (!showTURTLE || !indicators.turtle) return;
+
+    const turtleData = indicators.turtle;
+
+    if (turtleUpperRef.current) {
+      const raw = turtleData
+        .filter((p) => p.values.upper != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.upper }));
+      turtleUpperRef.current.setData(prepareChartData(raw));
+    }
+
+    if (turtleLowerRef.current) {
+      const raw = turtleData
+        .filter((p) => p.values.lower != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.lower }));
+      turtleLowerRef.current.setData(prepareChartData(raw));
+    }
+  }, [indicators, showTURTLE]);
+
+  // ─── Update Ichimoku Indicators ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!showICHIMOKU || !indicators.ichimoku) return;
+
+    const ichiData = indicators.ichimoku;
+
+    if (ichiTenkanRef.current) {
+      const raw = ichiData
+        .filter((p) => p.values.tenkan != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.tenkan }));
+      ichiTenkanRef.current.setData(prepareChartData(raw));
+    }
+
+    if (ichiKijunRef.current) {
+      const raw = ichiData
+        .filter((p) => p.values.kijun != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.kijun }));
+      ichiKijunRef.current.setData(prepareChartData(raw));
+    }
+
+    if (ichiSpanARef.current) {
+      const raw = ichiData
+        .filter((p) => p.values.span_a != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.span_a }));
+      ichiSpanARef.current.setData(prepareChartData(raw));
+    }
+
+    if (ichiSpanBRef.current) {
+      const raw = ichiData
+        .filter((p) => p.values.span_b != null)
+        .map((p) => ({ time: toChartTime(p.time), value: p.values.span_b }));
+      ichiSpanBRef.current.setData(prepareChartData(raw));
+    }
+  }, [indicators, showICHIMOKU]);
+
   // ─── Update Trade Markers ──────────────────────────────────────────────────
   useEffect(() => {
     if (!candleSeriesRef.current || !markers?.length || !klines.length) return;
@@ -500,6 +688,25 @@ export default function KlineChart({
     legendItems.push({ color: COLORS.bollUpper, label: "BOLL上轨" });
     legendItems.push({ color: COLORS.bollMiddle, label: "BOLL中轨" });
     legendItems.push({ color: COLORS.bollLower, label: "BOLL下轨" });
+  }
+  if (showEMA) {
+    legendItems.push({ color: COLORS.emaFast, label: "EMA快" });
+    legendItems.push({ color: COLORS.emaMid, label: "EMA中" });
+    legendItems.push({ color: COLORS.emaSlow, label: "EMA慢" });
+  }
+  if (showATR) {
+    legendItems.push({ color: COLORS.atrStop, label: "止损线", dashed: true });
+    legendItems.push({ color: COLORS.atrHighest, label: "趋势线", dashed: true });
+  }
+  if (showTURTLE) {
+    legendItems.push({ color: COLORS.turtleUpper, label: "入场上轨" });
+    legendItems.push({ color: COLORS.turtleLower, label: "出场下轨" });
+  }
+  if (showICHIMOKU) {
+    legendItems.push({ color: COLORS.ichiTenkan, label: "转折线" });
+    legendItems.push({ color: COLORS.ichiKijun, label: "基准线" });
+    legendItems.push({ color: COLORS.ichiSpanA, label: "先行A", dashed: true });
+    legendItems.push({ color: COLORS.ichiSpanB, label: "先行B", dashed: true });
   }
 
   return (

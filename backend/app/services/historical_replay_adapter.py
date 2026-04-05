@@ -39,6 +39,9 @@ class HistoricalReplayAdapter(DataAdapter):
         self._total_paused_time: float = 0.0
         self._pause_start_time: Optional[float] = None
 
+        # Track interval for dynamic snapshot interval adaptation
+        self._kline_interval: Optional[str] = None
+
         # Error tracking and health monitoring
         self.error_count = 0
         self.warnings: list = []  # 最多保留最近20条
@@ -50,6 +53,21 @@ class HistoricalReplayAdapter(DataAdapter):
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt
+
+    @staticmethod
+    def _get_snapshot_interval_seconds(interval: str) -> int:
+        """根据K线周期自动适配权益快照间隔，使回测与回放粒度一致"""
+        interval_map = {
+            "1m": 60,       # 每根K线
+            "3m": 180,      # 每根K线
+            "5m": 300,      # 每根K线
+            "15m": 900,     # 每根K线
+            "30m": 1800,    # 每根K线
+            "1h": 3600,     # 每根K线
+            "4h": 3600,     # 每小时（比K线更频繁）
+            "1d": 3600,     # 每小时
+        }
+        return interval_map.get(interval, 3600)
 
     def get_current_simulated_time(self) -> datetime:
         """Calculate the current simulated time based on the clock and speed.
@@ -250,7 +268,10 @@ class HistoricalReplayAdapter(DataAdapter):
             ) from e
 
         self.cursor = 0
-        logger.info(f"Loaded {len(self.data)} bars for replay")
+        logger.info(f"Loaded {len(self.data)} bars for replay ({symbol} {interval})")
+        if len(self.data) == 0:
+            logger.warning(f"⚠️ 零K线数据! symbol={symbol}, interval={interval}, "
+                          f"range={self.config.start_time} to {self.config.end_time}")
         if self.data:
             first_bar = self.data[0]
             last_bar = self.data[-1]
@@ -264,6 +285,7 @@ class HistoricalReplayAdapter(DataAdapter):
         Implementation of DataAdapter.subscribe.
         For Historical Replay, we use this to register the callback with the bus.
         """
+        self._kline_interval = interval
         for symbol in symbols:
             # For simplicity, we assume one symbol per replay session for now
             try:
@@ -292,6 +314,11 @@ class HistoricalReplayAdapter(DataAdapter):
         self.is_running = True
         self.is_paused = False
         self._last_equity_snapshot_time = None
+
+        # 根据K线周期动态适配权益快照间隔
+        if self._kline_interval:
+            self._equity_snapshot_interval_sec = self._get_snapshot_interval_seconds(self._kline_interval)
+            logger.info(f"Equity snapshot interval adapted to {self._equity_snapshot_interval_sec}s for {self._kline_interval} kline")
 
         self._start_real_time = time.time()
         self._start_sim_time = self.data[self.cursor].datetime

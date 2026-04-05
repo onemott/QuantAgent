@@ -333,17 +333,28 @@ class TradingBusImpl(TradingBus):
         self.current_simulated_time = bar.datetime
         if self.mode == "HISTORICAL_REPLAY":
             self.execution_router.set_simulated_time(bar.datetime)
-        tasks = [callback(bar) for callback in self.bar_subscribers]
-        if tasks:
-            await asyncio.gather(*tasks)
+        for callback in self.bar_subscribers:
+            if asyncio.iscoroutinefunction(callback):
+                asyncio.ensure_future(callback(bar))
+            else:
+                # Sync callback: run directly (non-blocking, fire-and-forget)
+                try:
+                    callback(bar)
+                except Exception as e:
+                    logger.error(f"Sync callback error in publish_bar: {e}")
 
     async def publish_tick(self, tick: TickData):
         self.current_simulated_time = tick.datetime
         if self.mode == "HISTORICAL_REPLAY":
             self.execution_router.set_simulated_time(tick.datetime)
-        tasks = [callback(tick) for callback in self.tick_subscribers]
-        if tasks:
-            await asyncio.gather(*tasks)
+        for callback in self.tick_subscribers:
+            if asyncio.iscoroutinefunction(callback):
+                asyncio.ensure_future(callback(tick))
+            else:
+                try:
+                    callback(tick)
+                except Exception as e:
+                    logger.error(f"Sync callback error in publish_tick: {e}")
 
     async def jump_to(self, timestamp: datetime):
         """Jump to a specific timestamp in historical replay mode"""

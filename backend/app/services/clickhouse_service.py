@@ -291,7 +291,7 @@ class ClickHouseService:
         interval: str,
         start: Optional[datetime] = None,
         end: Optional[datetime]   = None,
-        limit: int = 2000,
+        limit: int = 100000,
     ) -> Optional[pd.DataFrame]:
         """
         Return K-lines as a pandas DataFrame with DatetimeIndex.

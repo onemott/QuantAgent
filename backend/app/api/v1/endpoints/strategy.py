@@ -510,6 +510,9 @@ def _run_backtest_engine(
         except Exception:
             signals = asyncio.run(signals)
     
+    from app.services.paper_trading_service import SLIPPAGE_PCT
+    slippage_pct = float(SLIPPAGE_PCT)
+
     capital = initial_capital
     position = 0.0
     entry_price = 0.0
@@ -527,14 +530,16 @@ def _run_backtest_engine(
         signal = int(signals.iloc[i]) if i < len(signals) else 0
         current_time = times[i]
 
+        # 权益计算使用市场价（不含滑点）
         current_equity = capital + position * price
         equity_list.append(current_equity)
 
         if signal == 1 and position == 0 and capital > 0:
+            effective_buy_price = price * (1 + slippage_pct)  # 买入滑点
             fee = capital * commission
             invest = capital - fee
-            position = invest / price
-            entry_price = price
+            position = invest / effective_buy_price
+            entry_price = effective_buy_price
             entry_time = current_time
             total_commission += fee
             capital = 0.0
@@ -546,19 +551,20 @@ def _run_backtest_engine(
             })
 
         elif signal == -1 and position > 0:
-            gross = position * price
+            effective_sell_price = price * (1 - slippage_pct)  # 卖出滑点
+            gross = position * effective_sell_price
             fee = gross * commission
             net = gross - fee
             total_commission += fee
 
             pnl = net - (entry_price * position * (1 + commission))
-            pnl_pct = (price / entry_price - 1) * 100 - commission * 200
+            pnl_pct = (effective_sell_price / entry_price - 1) * 100 - commission * 200
 
             trades.append({
                 "entry_time":  str(entry_time)[:19],
                 "exit_time":   str(current_time)[:19],
                 "entry_price": round(entry_price, 6),
-                "exit_price":  round(price, 6),
+                "exit_price":  round(effective_sell_price, 6),
                 "quantity":    round(position, 8),
                 "pnl":         round(pnl, 4),
                 "pnl_pct":     round(pnl_pct, 4),
@@ -577,16 +583,17 @@ def _run_backtest_engine(
     # Force-close at last bar
     if position > 0:
         price = float(prices.iloc[-1])
-        fee = position * price * commission
-        net = position * price - fee
+        effective_sell_price = price * (1 - slippage_pct)  # 卖出滑点
+        fee = position * effective_sell_price * commission
+        net = position * effective_sell_price - fee
         total_commission += fee
         pnl = net - (entry_price * position * (1 + commission))
-        pnl_pct = (price / entry_price - 1) * 100 - commission * 200
+        pnl_pct = (effective_sell_price / entry_price - 1) * 100 - commission * 200
         trades.append({
             "entry_time":  str(entry_time)[:19],
             "exit_time":   str(times[-1])[:19],
             "entry_price": round(entry_price, 6),
-            "exit_price":  round(price, 6),
+            "exit_price":  round(effective_sell_price, 6),
             "quantity":    round(position, 8),
             "pnl":         round(pnl, 4),
             "pnl_pct":     round(pnl_pct, 4),

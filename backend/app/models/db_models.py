@@ -97,6 +97,7 @@ class PaperTrade(Base):
     order_type = Column(String(10), nullable=False, default="MARKET")
     quantity = Column(Numeric(20, 8), nullable=False)
     price = Column(Numeric(20, 8), nullable=False)
+    leverage = Column(Integer, nullable=False, default=1)
     benchmark_price = Column(Numeric(20, 8), nullable=True)
     fee = Column(Numeric(20, 8), nullable=False, default=0)
     funding_fee = Column(Numeric(20, 8), nullable=False, default=0)
