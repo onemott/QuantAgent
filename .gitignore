@@ -82,7 +82,8 @@ verify_*.py
 # ── Misc project-local files ──────────────────────────────────────────────────
 review_*.txt
 review_*.py
-工程功能评估报告.md
+*报告.md
+*需求拆解*.md
 技术债务记录*.txt
 智能体Skill系统使用指南.md
 界面功能复查与协调.txt
