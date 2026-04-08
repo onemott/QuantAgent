@@ -99,6 +99,7 @@ class VectorizedBacktester:
             "total_trades": total_trades,
             "final_capital": final_capital,
             "equity_curve": equity_curve.tolist(), # Can be large
+            "returns": net_returns.tolist(), # Add returns
             "win_rate": 0.0, # Placeholder, hard to calc accurately in vector mode
             "profit_factor": 0.0 # Placeholder
         }

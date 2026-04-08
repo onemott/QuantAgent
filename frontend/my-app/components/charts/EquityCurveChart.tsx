@@ -7,14 +7,21 @@ export interface TradeMarker {
   time: string;
   price: number;
   side: "BUY" | "SELL";
-  quantity: number;
+  quantity?: number;
   pnl?: number | null;
+}
+
+export interface WindowBoundary {
+  time: string;
+  label: string;
+  color?: string;
 }
 
 interface EquityCurveChartProps {
   data: { t: string; v: number }[];
   baselineData?: { t: string; v: number }[];
   markers?: TradeMarker[];
+  windowBoundaries?: WindowBoundary[];
   initialCapital: number;
   height?: number;
   showLegend?: boolean;
@@ -53,6 +60,7 @@ export function EquityCurveChart({
   data,
   baselineData = [],
   markers = [],
+  windowBoundaries = [],
   initialCapital,
   height = 280,
   showLegend = true,
@@ -196,32 +204,57 @@ export function EquityCurveChart({
     };
   }, [curveTimestamps]);
 
-  // Add buy/sell markers
+  // Add buy/sell markers and window boundaries
   useEffect(() => {
-    if (!seriesRef.current || !markers?.length || !data.length) return;
+    if (!seriesRef.current || !data.length) return;
     
-    // Convert markers and snap to nearest curve time
-    const rawMarkerData = markers.map(mk => {
-      const markerTime = Math.floor(new Date(mk.time.slice(0, 19)).getTime() / 1000);
-      // Snap to nearest curve timestamp to ensure marker is visible
-      const snappedTime = snapToNearestTime(markerTime);
-      return {
-        time: snappedTime as Time,
-        position: mk.side === "BUY" ? ("belowBar" as const) : ("aboveBar" as const),
-        color: mk.side === "BUY" ? "#22c55e" : "#ef4444",
-        shape: mk.side === "BUY" ? ("arrowUp" as const) : ("arrowDown" as const),
-        text: mk.side === "BUY"
-          ? "买"
-          : `卖${mk.pnl != null ? (mk.pnl >= 0 ? ` +$${mk.pnl.toFixed(0)}` : ` -$${Math.abs(mk.pnl).toFixed(0)}`) : ""}`,
-        size: 1,
-      };
-    });
+    let rawMarkerData: any[] = [];
+
+    // Add trade markers
+    if (markers?.length) {
+      rawMarkerData = [...rawMarkerData, ...markers.map(mk => {
+        const markerTime = Math.floor(new Date(mk.time.slice(0, 19)).getTime() / 1000);
+        const snappedTime = snapToNearestTime(markerTime);
+        return {
+          time: snappedTime as Time,
+          position: mk.side === "BUY" ? ("belowBar" as const) : ("aboveBar" as const),
+          color: mk.side === "BUY" ? "#22c55e" : "#ef4444",
+          shape: mk.side === "BUY" ? ("arrowUp" as const) : ("arrowDown" as const),
+          text: mk.side === "BUY"
+            ? "买"
+            : `卖${mk.pnl != null ? (mk.pnl >= 0 ? ` +$${mk.pnl.toFixed(0)}` : ` -$${Math.abs(mk.pnl).toFixed(0)}`) : ""}`,
+          size: 1,
+        };
+      })];
+    }
+
+    // Add window boundaries
+    if (windowBoundaries?.length) {
+      rawMarkerData = [...rawMarkerData, ...windowBoundaries.map(wb => {
+        const markerTime = Math.floor(new Date(wb.time.slice(0, 19)).getTime() / 1000);
+        const snappedTime = snapToNearestTime(markerTime);
+        return {
+          time: snappedTime as Time,
+          position: "inBar" as const,
+          color: wb.color || "#f59e0b",
+          shape: "circle" as const,
+          text: wb.label,
+          size: 2,
+        };
+      })];
+    }
+
+    if (rawMarkerData.length === 0) {
+      // Clear markers if none
+      createSeriesMarkers(seriesRef.current, []);
+      return;
+    }
     
     // Dedupe and sort markers (keep last for same time)
     const markerData = prepareChartData(rawMarkerData);
     
     createSeriesMarkers(seriesRef.current, markerData);
-  }, [markers, data, snapToNearestTime]);
+  }, [markers, windowBoundaries, data, snapToNearestTime]);
 
   // Calculate return percentage for display
   const currentEquity = data.length > 0 ? data[data.length - 1].v : initialCapital;

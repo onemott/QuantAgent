@@ -12,7 +12,9 @@ from . import (
     replay,
     profiles,
     composition,
-    skill
+    skill,
+    dynamic_selection,
+    walk_forward
 )
 
 __all__ = [
@@ -25,5 +27,7 @@ __all__ = [
     "replay",
     "profiles",
     "composition",
-    "skill"
+    "skill",
+    "dynamic_selection",
+    "walk_forward"
 ]

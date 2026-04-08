@@ -33,6 +33,17 @@ class WeightedComposer(StrategyComposer):
         self.weights = weights or {}
         self.threshold = threshold
         
+    def update_weights(self, new_weights: Dict[str, float]) -> None:
+        """动态更新组合权重
+        
+        Args:
+            new_weights: 新的权重字典
+        """
+        # 可以选择归一化后再更新
+        normalized = self.normalize_weights(new_weights)
+        self.weights = normalized
+        logger.info(f"动态更新组合权重: {self.weights}")
+
     async def combine_signals(
         self, 
         df: pd.DataFrame,

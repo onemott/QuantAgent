@@ -20,24 +20,11 @@ const COOLDOWN_SECONDS = 30;
 
 // 动态获取 WebSocket URL，优先适配当前环境
 const getWsUrl = () => {
-  if (typeof window === "undefined") return "ws://localhost:8002/ws/market";
+  if (typeof window === "undefined") return "";
   
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
-  const isDocker = apiUrl.includes("backend:");
-  
-  // Docker 环境：直接连接 Backend WebSocket（宿主机端口映射）
-  // 浏览器访问 localhost:3002 时，Docker 容器通过 host.docker.internal 或端口映射访问
-  if (isDocker) {
-    return "ws://localhost:8002/ws/market";
-  }
-  
-  // 如果配置了具体的生产环境 URL 且不包含 localhost，则使用配置
-  if (process.env.NEXT_PUBLIC_WS_URL && !process.env.NEXT_PUBLIC_WS_URL.includes("localhost")) {
-    return process.env.NEXT_PUBLIC_WS_URL;
-  }
-  
-  // 本地开发环境：直接连接 Backend WebSocket
-  return "ws://localhost:8002/ws/market";
+  // 统一使用相对路径并通过 Next.js 的 rewrites 转发，避免硬编码的绝对域名路径
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/ws/market`;
 };
 
 type AnalysisCache = Record<string, { result: string; timestamp: number; outputContent?: string; thinkingContent?: string }>;

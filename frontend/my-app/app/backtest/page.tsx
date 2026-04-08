@@ -3,6 +3,10 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import { CompositionCompareChart } from "@/components/charts/CompositionCompareChart";
+import { WfeCompareChart } from "@/components/charts/WfeCompareChart";
+import { ParamStabilityChart } from "@/components/charts/ParamStabilityChart";
+import { EquityCurveChart } from "@/components/charts/EquityCurveChart";
+import { MarketConfigPanel } from "@/components/backtest/MarketConfigPanel";
 import { createChart, LineSeries, createSeriesMarkers, IChartApi, ISeriesApi, Time } from "lightweight-charts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -61,6 +65,7 @@ interface TradeMarker {
   time: string;
   price: number;
   side: "BUY" | "SELL";
+  quantity?: number;
   pnl?: number | null;
 }
 
@@ -76,137 +81,6 @@ interface BacktestResult {
   markers: TradeMarker[];
   trades: TradeRecord[];
   created_at: string;
-}
-
-// ─── Equity Curve Chart ───────────────────────────────────────────────────────
-function EquityCurveChart({
-  data,
-  baselineData,
-  markers,
-  initialCapital,
-}: {
-  data: { t: string; v: number }[];
-  baselineData: { t: string; v: number }[];
-  markers: TradeMarker[];
-  initialCapital: number;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const chartRef     = useRef<IChartApi | null>(null);
-  const seriesRef    = useRef<ISeriesApi<"Line"> | null>(null);
-  const baselineRef  = useRef<ISeriesApi<"Line"> | null>(null);
-
-  useEffect(() => {
-    if (!containerRef.current) return;
-    const chart = createChart(containerRef.current, {
-      layout:    { background: { color: "#0f172a" }, textColor: "#94a3b8" },
-      grid:      { vertLines: { color: "#1e293b" }, horzLines: { color: "#1e293b" } },
-      rightPriceScale: { borderColor: "#334155" },
-      timeScale: { borderColor: "#334155", timeVisible: true },
-      autoSize:  true,
-    });
-    // Strategy curve (blue)
-    const series = chart.addSeries(LineSeries, {
-      color:     "#3b82f6",
-      lineWidth: 2,
-      priceLineVisible: false,
-      title: "策略",
-    });
-    // Baseline curve (gray dashed)
-    const baseline = chart.addSeries(LineSeries, {
-      color:     "#64748b",
-      lineWidth: 1,
-      priceLineVisible: false,
-      title: "买入持有",
-      lineStyle: 2, // dashed
-    });
-    // Initial capital reference line
-    series.createPriceLine({
-      price: initialCapital,
-      color: "#475569",
-      lineWidth: 1,
-      lineStyle: 2,
-      axisLabelVisible: true,
-      title: "初始",
-    });
-    chartRef.current   = chart;
-    seriesRef.current  = series;
-    baselineRef.current = baseline;
-    return () => { chart.remove(); };
-  }, [initialCapital]);
-
-  // Update strategy curve
-  useEffect(() => {
-    if (!seriesRef.current || !data.length) return;
-    // Remove duplicates and sort by time to ensure data integrity
-    const seen = new Set<number>();
-    const points = data
-      .map(d => ({ time: (new Date(d.t).getTime() / 1000) as Time, value: d.v }))
-      .filter(p => {
-        const t = p.time as number;
-        if (seen.has(t)) return false;
-        seen.add(t);
-        return true;
-      })
-      .sort((a, b) => (a.time as number) - (b.time as number));
-    seriesRef.current.setData(points);
-    chartRef.current?.timeScale().fitContent();
-  }, [data]);
-
-  // Update baseline curve
-  useEffect(() => {
-    if (!baselineRef.current || !baselineData?.length) return;
-    // Remove duplicates and sort by time to ensure data integrity
-    const seen = new Set<number>();
-    const points = baselineData
-      .map(d => ({ time: (new Date(d.t).getTime() / 1000) as Time, value: d.v }))
-      .filter(p => {
-        const t = p.time as number;
-        if (seen.has(t)) return false;
-        seen.add(t);
-        return true;
-      })
-      .sort((a, b) => (a.time as number) - (b.time as number));
-    baselineRef.current.setData(points);
-  }, [baselineData]);
-
-  // Add buy/sell markers on strategy series (lightweight-charts v5: createSeriesMarkers)
-  useEffect(() => {
-    if (!seriesRef.current || !markers?.length || !data.length) return;
-    const markerData = markers
-      .map(mk => ({
-        time: (new Date(mk.time.slice(0, 19)).getTime() / 1000) as Time,
-        position: mk.side === "BUY" ? ("belowBar" as const) : ("aboveBar" as const),
-        color: mk.side === "BUY" ? "#22c55e" : "#ef4444",
-        shape: mk.side === "BUY" ? ("arrowUp" as const) : ("arrowDown" as const),
-        text: mk.side === "BUY"
-          ? "买"
-          : `卖${mk.pnl != null ? (mk.pnl >= 0 ? ` +$${mk.pnl.toFixed(0)}` : ` -$${Math.abs(mk.pnl).toFixed(0)}`) : ""}`,
-        size: 1,
-      }))
-      .sort((a, b) => (a.time as number) - (b.time as number));
-    createSeriesMarkers(seriesRef.current, markerData);
-  }, [markers, data]);
-
-  return (
-    <div className="relative">
-      <div ref={containerRef} className="w-full h-[320px]" />
-      {/* Legend */}
-      <div className="absolute top-2 left-3 flex items-center gap-4 pointer-events-none">
-        <div className="flex items-center gap-1.5">
-          <div className="w-5 h-0.5 bg-blue-500 rounded" />
-          <span className="text-[10px] text-slate-400">策略</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-5 h-0.5 bg-slate-500 rounded border-dashed" style={{ borderBottom: "1px dashed #64748b", background: "none" }} />
-          <span className="text-[10px] text-slate-400">买入持有（基准）</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] text-green-400">▲ 买入</span>
-          <span className="text-[10px] text-red-400">▼ 卖出</span>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 // ─── Metric Card ──────────────────────────────────────────────────────────────
@@ -714,12 +588,54 @@ export default function BacktestPage() {
   const [deleteTarget, setDeleteTarget] = useState<any>(null); // Record to delete
 
   // Composition Mode
-  const [backtestMode, setBacktestMode] = useState<"single" | "composition">("single");
+  const [backtestMode, setBacktestMode] = useState<"single" | "composition" | "wfa">("single");
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
   const [compositionType, setCompositionType] = useState<"weighted" | "voting">("weighted");
   const [compositionRunning, setCompositionRunning] = useState(false);
   const [compositionError, setCompositionError] = useState<string | null>(null);
   const [compositionResult, setCompositionResult] = useState<any>(null);
+
+  // WFA Mode
+  const [wfaRunning, setWfaRunning] = useState(false);
+  const [wfaError, setWfaError] = useState<string | null>(null);
+  const [wfaResult, setWfaResult] = useState<any>(null);
+  const [wfaTrainRatio, setWfaTrainRatio] = useState<number>(0.7);
+  const [wfaWindowsCount, setWfaWindowsCount] = useState<number>(5);
+
+  const handleWfaRun = async () => {
+    setWfaRunning(true);
+    setWfaError(null);
+    try {
+      const requestBody: Record<string, any> = {
+        strategy_type: selectedType,
+        symbol,
+        interval,
+        limit,
+        initial_capital: initialCapital,
+        train_ratio: wfaTrainRatio,
+        n_windows: wfaWindowsCount,
+      };
+      if (startTime && endTime) {
+        requestBody.start_time = new Date(startTime).toISOString();
+        requestBody.end_time = new Date(endTime).toISOString();
+      }
+      const res = await fetch("/api/v1/strategy/wfa/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setWfaError(data.detail || data.message || "WFA 分析失败");
+        return;
+      }
+      setWfaResult(data);
+    } catch (e) {
+      setWfaError("网络错误: " + String(e));
+    } finally {
+      setWfaRunning(false);
+    }
+  };
 
   const symbols = [
     { value: "BTCUSDT", label: "BTC/USDT" }, { value: "ETHUSDT", label: "ETH/USDT" },
@@ -966,6 +882,19 @@ export default function BacktestPage() {
               策略组合
             </div>
           </button>
+          <button
+            onClick={() => setBacktestMode("wfa")}
+            className={`px-4 py-2 text-sm rounded-lg transition-all ${
+              backtestMode === "wfa"
+                ? "bg-orange-600/20 text-orange-400 border border-orange-500/30 font-medium"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <RefreshCw className="w-4 h-4" />
+              推进分析 (WFA)
+            </div>
+          </button>
         </div>
 
         {/* Single Strategy Mode */}
@@ -1060,118 +989,16 @@ export default function BacktestPage() {
             )}
 
             {/* Market Config */}
-            <Card className="bg-slate-900 border-slate-700/50">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
-                  <div className="w-6 h-6 bg-green-500/10 rounded flex items-center justify-center border border-green-500/20">
-                    <TrendingUp className="w-3.5 h-3.5 text-green-400" />
-                  </div>
-                  回测配置
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">交易对</label>
-                  <Select value={symbol} onValueChange={setSymbol}>
-                    <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-700">
-                      {symbols.map(s => (
-                        <SelectItem key={s.value} value={s.value} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{s.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">K线周期</label>
-                  <Select value={interval} onValueChange={setIntervalVal}>
-                    <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-700">
-                      {intervals.map(i => (
-                        <SelectItem key={i.value} value={i.value} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{i.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">K线数量</label>
-                  <Select value={String(limit)} onValueChange={v => setLimit(Number(v))}>
-                    <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-700">
-                      {limitOptions.map(o => (
-                        <SelectItem key={o.value} value={String(o.value)} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{o.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                {/* Date Range Selector */}
-                <div className="pt-2 border-t border-slate-700/50">
-                  <div className="flex items-center justify-between mb-2">
-                    <label className="text-xs text-slate-400 flex items-center gap-1.5">
-                      <Clock className="w-3.5 h-3.5" />
-                      日期范围（可选）
-                    </label>
-                    {(startTime || endTime) && (
-                      <button
-                        onClick={() => { setStartTime(''); setEndTime(''); }}
-                        className="text-[10px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors"
-                      >
-                        <X className="w-3 h-3" />
-                        清除
-                      </button>
-                    )}
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="text-[10px] text-slate-500 mb-1 block">开始时间</label>
-                      <input
-                        type="datetime-local"
-                        value={startTime}
-                        onChange={e => setStartTime(e.target.value)}
-                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] text-slate-500 mb-1 block">结束时间</label>
-                      <input
-                        type="datetime-local"
-                        value={endTime}
-                        onChange={e => setEndTime(e.target.value)}
-                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-[10px] text-slate-500 mt-2">
-                    {startTime && endTime
-                      ? "将使用指定时间范围内的历史数据"
-                      : "默认使用最近 N 根 K 线数据"}
-                  </p>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">初始资金 (USDT)</label>
-                  <div className="flex gap-2">
-                    {[5000, 10000, 50000].map(v => (
-                      <button
-                        key={v}
-                        onClick={() => setInitialCapital(v)}
-                        className={`flex-1 py-1.5 text-xs rounded-lg border transition-all ${
-                          initialCapital === v
-                            ? "bg-blue-600/20 border-blue-500/50 text-blue-400"
-                            : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
-                        }`}
-                      >
-                        {v >= 1000 ? `${v / 1000}K` : v}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
+            <MarketConfigPanel
+              symbol={symbol} setSymbol={setSymbol}
+              interval={interval} setIntervalVal={setIntervalVal}
+              limit={limit} setLimit={setLimit}
+              startTime={startTime} setStartTime={setStartTime}
+              endTime={endTime} setEndTime={setEndTime}
+              initialCapital={initialCapital} setInitialCapital={setInitialCapital}
+              symbols={symbols} intervals={intervals} limitOptions={limitOptions}
+              accentColor="blue"
+            />
 
             {/* Run Button */}
             <Button
@@ -1449,75 +1276,16 @@ export default function BacktestPage() {
             </Card>
 
             {/* Market Config (reused) */}
-            <Card className="bg-slate-900 border-slate-700/50">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
-                  <div className="w-6 h-6 bg-green-500/10 rounded flex items-center justify-center border border-green-500/20">
-                    <TrendingUp className="w-3.5 h-3.5 text-green-400" />
-                  </div>
-                  回测配置
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">交易对</label>
-                  <Select value={symbol} onValueChange={setSymbol}>
-                    <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-700">
-                      {symbols.map(s => (
-                        <SelectItem key={s.value} value={s.value} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{s.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">K线周期</label>
-                  <Select value={interval} onValueChange={setIntervalVal}>
-                    <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-700">
-                      {intervals.map(i => (
-                        <SelectItem key={i.value} value={i.value} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{i.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">K线数量</label>
-                  <Select value={String(limit)} onValueChange={v => setLimit(Number(v))}>
-                    <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-700">
-                      {limitOptions.map(o => (
-                        <SelectItem key={o.value} value={String(o.value)} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{o.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1.5 block">初始资金 (USDT)</label>
-                  <div className="flex gap-2">
-                    {[5000, 10000, 50000].map(v => (
-                      <button
-                        key={v}
-                        onClick={() => setInitialCapital(v)}
-                        className={`flex-1 py-1.5 text-xs rounded-lg border transition-all ${
-                          initialCapital === v
-                            ? "bg-purple-600/20 border-purple-500/50 text-purple-400"
-                            : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
-                        }`}
-                      >
-                        {v >= 1000 ? `${v / 1000}K` : v}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
+            <MarketConfigPanel
+              symbol={symbol} setSymbol={setSymbol}
+              interval={interval} setIntervalVal={setIntervalVal}
+              limit={limit} setLimit={setLimit}
+              startTime={startTime} setStartTime={setStartTime}
+              endTime={endTime} setEndTime={setEndTime}
+              initialCapital={initialCapital} setInitialCapital={setInitialCapital}
+              symbols={symbols} intervals={intervals} limitOptions={limitOptions}
+              accentColor="purple"
+            />
 
             {/* Run Button */}
             <Button
@@ -1659,6 +1427,270 @@ export default function BacktestPage() {
             )}
           </div>
         </div>
+        )}
+
+        {/* WFA Mode */}
+        {backtestMode === "wfa" && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-1 space-y-4">
+              {/* Strategy Selection */}
+              <Card className="bg-slate-900 border-slate-700/50">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
+                    <div className="w-6 h-6 bg-orange-500/10 rounded flex items-center justify-center border border-orange-500/20">
+                      <RefreshCw className="w-3.5 h-3.5 text-orange-400" />
+                    </div>
+                    策略选择
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <Select value={selectedType} onValueChange={setSelectedType}>
+                    <SelectTrigger className="bg-slate-800 border-slate-700 text-slate-200">
+                      <SelectValue placeholder="选择策略" />
+                    </SelectTrigger>
+                    <SelectContent className="bg-slate-800 border-slate-700">
+                      {templates.map(t => (
+                        <SelectItem key={t.id} value={t.id} className="text-slate-200 focus:bg-slate-700">
+                          {t.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </CardContent>
+              </Card>
+
+              {/* WFA Specific Config */}
+              <Card className="bg-slate-900 border-slate-700/50">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
+                    <div className="w-6 h-6 bg-orange-500/10 rounded flex items-center justify-center border border-orange-500/20">
+                      <Layers className="w-3.5 h-3.5 text-orange-400" />
+                    </div>
+                    WFA 参数
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div>
+                    <div className="flex justify-between text-xs text-slate-300 mb-1">
+                      <label>训练集比例 (Train Ratio)</label>
+                      <span>{(wfaTrainRatio * 100).toFixed(0)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.3} max={0.9} step={0.05}
+                      value={wfaTrainRatio}
+                      onChange={e => setWfaTrainRatio(parseFloat(e.target.value))}
+                      className="w-full h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer accent-orange-500"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-xs text-slate-300 mb-1">
+                      <label>窗口数量 (Windows)</label>
+                      <span>{wfaWindowsCount}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={3} max={20} step={1}
+                      value={wfaWindowsCount}
+                      onChange={e => setWfaWindowsCount(parseInt(e.target.value))}
+                      className="w-full h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer accent-orange-500"
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+
+              <MarketConfigPanel
+                symbol={symbol} setSymbol={setSymbol}
+                interval={interval} setIntervalVal={setIntervalVal}
+                limit={limit} setLimit={setLimit}
+                startTime={startTime} setStartTime={setStartTime}
+                endTime={endTime} setEndTime={setEndTime}
+                initialCapital={initialCapital} setInitialCapital={setInitialCapital}
+                symbols={symbols} intervals={intervals} limitOptions={limitOptions}
+                accentColor="orange"
+              />
+
+              {/* Run Button */}
+              <Button
+                onClick={handleWfaRun}
+                disabled={wfaRunning}
+                className="w-full bg-orange-600 hover:bg-orange-500 text-white font-bold py-3 rounded-xl text-sm"
+              >
+                {wfaRunning
+                  ? <><RefreshCw className="w-4 h-4 animate-spin mr-2" />WFA 分析中...</>
+                  : <><Play className="w-4 h-4 mr-2" />运行 WFA</>}
+              </Button>
+
+              {wfaError && (
+                <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-xs flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  {wfaError}
+                </div>
+              )}
+            </div>
+
+            <div className="lg:col-span-2 space-y-6">
+              {!wfaResult ? (
+                <div className="flex flex-col items-center justify-center min-h-[400px] text-slate-500 space-y-4">
+                  <div className="w-20 h-20 bg-slate-800/50 rounded-2xl flex items-center justify-center border border-slate-700/50">
+                    <RefreshCw className="w-10 h-10 opacity-30" />
+                  </div>
+                  <div className="text-center">
+                    <p className="text-base font-medium text-slate-400">运行推进分析 (Walk-Forward Analysis)</p>
+                    <p className="text-sm text-slate-600 mt-1">通过滚动窗口回测验证策略参数的稳定性和鲁棒性</p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* WFA Result Header */}
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Badge className="bg-orange-500/10 text-orange-400 border-orange-500/20">WFA 结果</Badge>
+                      <Badge variant="outline" className="bg-slate-700 text-slate-300 border-slate-600 text-xs">
+                        {symbol} / {interval}
+                      </Badge>
+                      <span className="text-xs text-slate-500">{wfaResult.windows?.length || 0} 个窗口</span>
+                    </div>
+                  </div>
+
+                  {/* Overview Metrics */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <MetricCard
+                      label="整体 WFE"
+                      value={`${(wfaResult.overall_wfe * 100).toFixed(2)}%`}
+                      positive={wfaResult.overall_wfe >= 0.5}
+                      sub={wfaResult.overall_wfe >= 0.5 ? "参数具有一致性" : "存在过拟合风险"}
+                    />
+                    <MetricCard
+                      label="平均样本外年化"
+                      value={`${(wfaResult.average_test_annual_return * 100).toFixed(2)}%`}
+                      positive={wfaResult.average_test_annual_return >= 0}
+                    />
+                    <MetricCard
+                      label="平均胜率"
+                      value={`${((wfaResult.windows?.reduce((acc: number, w: any) => acc + (w.test_metrics?.win_rate || 0), 0) / (wfaResult.windows?.length || 1))).toFixed(1)}%`}
+                      positive={true}
+                    />
+                    <MetricCard
+                      label="测试集样本数"
+                      value={String(wfaResult.total_test_trades || 0)}
+                    />
+                  </div>
+
+                  {/* Equity Curve with Window Boundaries */}
+                  <Card className="bg-slate-900 border-slate-700/50">
+                    <CardHeader className="pb-2">
+                      <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
+                        <TrendingUp className="w-4 h-4 text-orange-400" />
+                        样本外拼接净值曲线 (OOS Equity Curve)
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="p-0 pb-2">
+                      <EquityCurveChart
+                        data={wfaResult.oos_equity_curve || []}
+                        initialCapital={initialCapital}
+                        windowBoundaries={wfaResult.windows?.map((w: any) => ({
+                          time: w.test_start,
+                          label: `W${w.window_index}`,
+                          color: "#f59e0b"
+                        }))}
+                      />
+                    </CardContent>
+                  </Card>
+
+                  {/* WFE and Param Stability Charts */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <Card className="bg-slate-900 border-slate-700/50">
+                      <CardHeader className="pb-2">
+                        <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
+                          <BarChart3 className="w-4 h-4 text-orange-400" />
+                          各窗口 WFE 对比
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <WfeCompareChart data={wfaResult.windows || []} height={250} />
+                      </CardContent>
+                    </Card>
+
+                    <Card className="bg-slate-900 border-slate-700/50">
+                      <CardHeader className="pb-2">
+                        <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
+                          <Activity className="w-4 h-4 text-orange-400" />
+                          最优参数演变
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <ParamStabilityChart data={wfaResult.windows || []} height={250} />
+                      </CardContent>
+                    </Card>
+                  </div>
+
+                  {/* Window Details Table */}
+                  <Card className="bg-slate-900 border-slate-700/50">
+                    <CardHeader className="pb-3">
+                      <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
+                        <Layers className="w-4 h-4 text-slate-400" />
+                        滚动窗口详情
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="p-0">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-b border-slate-800 bg-slate-900">
+                              <th className="px-3 py-2 text-left text-slate-400 font-medium">窗口</th>
+                              <th className="px-3 py-2 text-left text-slate-400 font-medium">训练集周期</th>
+                              <th className="px-3 py-2 text-left text-slate-400 font-medium">测试集周期</th>
+                              <th className="px-3 py-2 text-right text-slate-400 font-medium">IS 年化</th>
+                              <th className="px-3 py-2 text-right text-slate-400 font-medium">OOS 年化</th>
+                              <th className="px-3 py-2 text-right text-slate-400 font-medium">WFE</th>
+                              <th className="px-3 py-2 text-left text-slate-400 font-medium">最优参数</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(wfaResult.windows || []).map((w: any, i: number) => {
+                              const wfe = w.wfe || 0;
+                              const isReturn = w.train_metrics?.annual_return || 0;
+                              const oosReturn = w.test_metrics?.annual_return || 0;
+                              return (
+                                <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
+                                  <td className="px-3 py-2 text-slate-300 font-medium">W{w.window_index}</td>
+                                  <td className="px-3 py-2 text-slate-500 font-mono text-[10px]">
+                                    {new Date(w.train_start).toLocaleDateString()} - {new Date(w.train_end).toLocaleDateString()}
+                                  </td>
+                                  <td className="px-3 py-2 text-slate-500 font-mono text-[10px]">
+                                    {new Date(w.test_start).toLocaleDateString()} - {new Date(w.test_end).toLocaleDateString()}
+                                  </td>
+                                  <td className={`px-3 py-2 text-right font-mono ${isReturn >= 0 ? "text-green-400" : "text-red-400"}`}>
+                                    {(isReturn * 100).toFixed(2)}%
+                                  </td>
+                                  <td className={`px-3 py-2 text-right font-mono ${oosReturn >= 0 ? "text-green-400" : "text-red-400"}`}>
+                                    {(oosReturn * 100).toFixed(2)}%
+                                  </td>
+                                  <td className={`px-3 py-2 text-right font-mono font-bold ${wfe >= 0.5 ? "text-green-400" : wfe > 0 ? "text-amber-400" : "text-red-400"}`}>
+                                    {(wfe * 100).toFixed(2)}%
+                                  </td>
+                                  <td className="px-3 py-2">
+                                    <div className="flex flex-wrap gap-1">
+                                      {Object.entries(w.best_params || {}).map(([k, v]) => (
+                                        <Badge key={k} variant="outline" className="text-[9px] px-1 py-0 bg-slate-800 border-slate-700 text-slate-400">
+                                          {k}: {String(v)}
+                                        </Badge>
+                                      ))}
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </>
+              )}
+            </div>
+          </div>
         )}
       </main>
 

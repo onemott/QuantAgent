@@ -502,6 +502,150 @@ class SkillDefinitionDB(Base):
     last_executed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class WFOSession(Base):
+    """Walk-Forward Optimization Session"""
+
+    __tablename__ = "wfo_sessions"
+    __table_args__ = (
+        Index("idx_wfo_sessions_strategy_symbol", "strategy_type", "symbol"),
+        Index("idx_wfo_sessions_created", "created_at"),
+        Index("idx_wfo_sessions_status", "status"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_type = Column(String(50), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    interval = Column(String(5), nullable=False)
+    
+    # WFA Configuration
+    is_days = Column(Integer, nullable=False)
+    oos_days = Column(Integer, nullable=False)
+    step_days = Column(Integer, nullable=False)
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    initial_capital = Column(Float, nullable=False, default=100000.0)
+    
+    # Execution Status
+    status = Column(String(20), nullable=False, default="pending")  # pending, running, completed, failed
+    error_message = Column(Text, nullable=True)
+    
+    # Overall Results
+    metrics = Column(JSONB, nullable=False, default={})  # Overall WFE, PS, etc.
+    equity_curve = Column(JSONB, nullable=False, default=[])  # Stitched OOS equity curve
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class WFOWindowResult(Base):
+    """Walk-Forward Optimization Window Result"""
+
+    __tablename__ = "wfo_window_results"
+    __table_args__ = (
+        Index("idx_wfo_windows_session", "wfo_session_id"),
+        Index("idx_wfo_windows_index", "wfo_session_id", "window_index"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    wfo_session_id = Column(Integer, nullable=False)  # Links to WFOSession.id
+    window_index = Column(Integer, nullable=False)
+    
+    # Window Boundaries
+    is_start_time = Column(DateTime(timezone=True), nullable=False)
+    is_end_time = Column(DateTime(timezone=True), nullable=False)
+    oos_start_time = Column(DateTime(timezone=True), nullable=False)
+    oos_end_time = Column(DateTime(timezone=True), nullable=False)
+    
+    # Window Results
+    best_params = Column(JSONB, nullable=False, default={})
+    is_metrics = Column(JSONB, nullable=False, default={})
+    oos_metrics = Column(JSONB, nullable=False, default={})
+    
+    # Stability Metrics
+    wfe = Column(Float, nullable=True)  # Walk-Forward Efficiency (OOS / IS annualized return ratio)
+    param_stability = Column(Float, nullable=True)  # Parameter drift metric
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class StrategyEvaluation(Base):
+    """策略评估记录"""
+    
+    __tablename__ = "strategy_evaluations"
+    __table_args__ = (
+        Index("idx_strategy_eval_strategy", "strategy_id"),
+        Index("idx_strategy_eval_date", "evaluation_date"),
+        Index("idx_strategy_eval_created", "created_at"),
+    )
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id = Column(String(50), nullable=False)
+    evaluation_date = Column(DateTime(timezone=True), nullable=False)
+    
+    # 评估窗口
+    window_start = Column(DateTime(timezone=True), nullable=False)
+    window_end = Column(DateTime(timezone=True), nullable=False)
+    
+    # 基础绩效
+    total_return = Column(Float, nullable=True)
+    annual_return = Column(Float, nullable=True)
+    volatility = Column(Float, nullable=True)
+    max_drawdown = Column(Float, nullable=True)
+    sharpe_ratio = Column(Float, nullable=True)
+    sortino_ratio = Column(Float, nullable=True)
+    calmar_ratio = Column(Float, nullable=True)
+    win_rate = Column(Float, nullable=True)
+    num_trades = Column(Integer, nullable=True)
+    
+    # 综合得分
+    return_score = Column(Float, nullable=True)
+    risk_score = Column(Float, nullable=True)
+    risk_adjusted_score = Column(Float, nullable=True)
+    stability_score = Column(Float, nullable=True)
+    efficiency_score = Column(Float, nullable=True)
+    total_score = Column(Float, nullable=True)
+    
+    # 排名
+    rank = Column(Integer, nullable=True)
+    total_strategies = Column(Integer, nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SelectionHistory(Base):
+    """选择历史记录"""
+    
+    __tablename__ = "selection_history"
+    __table_args__ = (
+        Index("idx_selection_history_date", "evaluation_date"),
+        Index("idx_selection_history_created", "created_at"),
+    )
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    evaluation_date = Column(DateTime(timezone=True), nullable=False)
+    
+    # 策略池状态
+    total_strategies = Column(Integer, nullable=False, default=0)
+    surviving_count = Column(Integer, nullable=False, default=0)
+    eliminated_count = Column(Integer, nullable=False, default=0)
+    
+    # 淘汰详情
+    eliminated_strategy_ids = Column(JSONB, nullable=False, default=[])
+    elimination_reasons = Column(JSONB, nullable=False, default={})
+    
+    # 权重分配
+    strategy_weights = Column(JSONB, nullable=False, default={})
+    
+    # 组合绩效预测
+    expected_return = Column(Float, nullable=True)
+    expected_volatility = Column(Float, nullable=True)
+    expected_sharpe = Column(Float, nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class SkillExecutionDB(Base):
     """Skill执行记录数据库模型"""
     

@@ -2105,8 +2105,7 @@ function ReplayContentWithHydrationFix() {
                       </CardTitle>
                     </CardHeader>
                     <CardContent className="p-2">
-                      <KlineChart klines={klineData}indicators={indicatorData}markers={(tradeMarkers || []).map(m => ({ ...m, pnl: m.pnl ?? null }))}strategyType={session?.strategy_type || selectedType || "ma"}height={400}
-                      />
+                      <KlineChart klines={klineData} indicators={indicatorData} markers={(tradeMarkers || []).map(m => ({ ...m, pnl: m.pnl ?? null, quantity: m.quantity ?? 0 }))} strategyType={session?.strategy_type || selectedType || "ma"} height={400} />
                     </CardContent>
                   </Card>
                 )}
