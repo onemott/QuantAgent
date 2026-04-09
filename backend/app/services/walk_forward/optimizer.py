@@ -144,9 +144,11 @@ class WalkForwardOptimizer:
                 "oos_period": [test_start.isoformat(), test_end.isoformat()],
                 "best_params": best_params,
                 "is_sharpe": opt_res["best_sharpe"],
+                "is_return": is_perf.get("total_return", 0.0),
                 "oos_sharpe": oos_perf.get("sharpe_ratio", 0.0),
                 "oos_return": oos_perf.get("total_return", 0.0),
-                "oos_drawdown": oos_perf.get("max_drawdown", 0.0)
+                "oos_drawdown": oos_perf.get("max_drawdown", 0.0),
+                "oos_trades": oos_perf.get("total_trades", 0)
             })
 
         # 2. Use StabilityAnalyzer
@@ -208,6 +210,17 @@ class WalkForwardOptimizer:
                 param_scores[k] = float(v)
         stability_report["parameter_stability_scores"] = param_scores
 
+        # Extract overall_wfe from stability_analysis
+        overall_wfe = stability_report.get("average_wfe", 0.0)
+        if isinstance(overall_wfe, (np.float64, np.float32)):
+            overall_wfe = float(overall_wfe)
+        
+        # Get avg_oos_annual_return from stitched_oos_performance
+        avg_oos_annual_return = stitched_metrics.get("annual_return", 0.0)
+        
+        # Sum up all OOS trades
+        total_oos_trades = int(np.sum([r.get("oos_trades", 0) for r in results]))
+        
         return {
             "strategy": self.strategy_type,
             "walk_forward_results": results,
@@ -216,6 +229,9 @@ class WalkForwardOptimizer:
             "metrics": {
                 "avg_oos_sharpe": round(np.mean([r["oos_sharpe"] for r in results]) if results else 0.0, 2),
                 "total_oos_return": round(np.sum([r["oos_return"] for r in results]) if results else 0.0, 4),
-                "num_windows": len(results)
+                "num_windows": len(results),
+                "overall_wfe": round(overall_wfe, 4) if overall_wfe else 0.0,
+                "avg_oos_annual_return": round(avg_oos_annual_return, 2) if avg_oos_annual_return else 0.0,
+                "total_oos_trades": total_oos_trades
             }
         }

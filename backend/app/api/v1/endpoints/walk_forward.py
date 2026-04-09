@@ -151,6 +151,9 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
                     "avg_oos_sharpe": wfo_result["metrics"].get("avg_oos_sharpe", 0.0),
                     "total_oos_return": wfo_result["metrics"].get("total_oos_return", 0.0),
                     "num_windows": wfo_result["metrics"].get("num_windows", 0),
+                    "overall_wfe": wfo_result["metrics"].get("overall_wfe", 0.0),
+                    "avg_oos_annual_return": wfo_result["metrics"].get("avg_oos_annual_return", 0.0),
+                    "total_oos_trades": wfo_result["metrics"].get("total_oos_trades", 0),
                     "stability_analysis": wfo_result.get("stability_analysis", {})
                 }
                 
@@ -167,6 +170,13 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
                 wfe_list = stability_analysis.get("wfe_per_window", [])
                 
                 for i, w in enumerate(wfo_result.get("walk_forward_results", [])):
+                    # Convert numpy types to native Python types for JSON serialization
+                    wfe_value = w.get("wfe")
+                    if wfe_value is None and i < len(wfe_list):
+                        wfe_value = wfe_list[i]
+                    if hasattr(wfe_value, 'item'):  # numpy scalar
+                        wfe_value = wfe_value.item()
+                    
                     win = WFOWindowResult(
                         wfo_session_id=session_id,
                         window_index=w["window_index"],
@@ -175,13 +185,17 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
                         oos_start_time=datetime.fromisoformat(w["oos_period"][0]),
                         oos_end_time=datetime.fromisoformat(w["oos_period"][1]),
                         best_params=w["best_params"],
-                        is_metrics={"sharpe": w.get("is_sharpe", 0.0)},
+                        is_metrics={
+                            "sharpe": w.get("is_sharpe", 0.0),
+                            "return": w.get("is_return", 0.0)
+                        },
                         oos_metrics={
                             "sharpe": w.get("oos_sharpe", 0.0),
                             "return": w.get("oos_return", 0.0),
-                            "drawdown": w.get("oos_drawdown", 0.0)
+                            "drawdown": w.get("oos_drawdown", 0.0),
+                            "trades": w.get("oos_trades", 0)
                         },
-                        wfe=w.get("wfe", wfe_list[i] if i < len(wfe_list) else None),
+                        wfe=wfe_value,
                         param_stability=stability_analysis.get("parameter_stability_scores", {}).get(str(i))
                     )
                     session_db.add(win)

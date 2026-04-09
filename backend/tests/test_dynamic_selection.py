@@ -16,11 +16,12 @@ def test_evaluator_boundary_conditions():
     evaluator = StrategyEvaluator()
     
     # Test extreme values
+    # Note: PerformanceMetric stores values in percentage form (e.g., 25.0 means 25%, not 0.25)
     perf = PerformanceMetric(
-        annualized_return=0.25,  # > 0.2, should cap return score to 30.0
-        max_drawdown_pct=0.35,   # > 0.3, should cap risk score to 0.0
+        annualized_return=25.0,  # 25% (> 20% threshold), should cap return score to 30.0
+        max_drawdown_pct=35.0,   # 35% (> 30% threshold), should cap risk score to 0.0
         sharpe_ratio=2.5,        # > 2.0, should cap sharpe score to 25.0
-        win_rate=0.8,            # 80%, stability score = 8.0
+        win_rate=80.0,           # 80%, stability score = 8.0
         total_trades=15          # >= 10, efficiency score = 10.0
     )
     

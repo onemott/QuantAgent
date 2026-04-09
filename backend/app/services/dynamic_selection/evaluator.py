@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 from app.models.db_models import PerformanceMetric, StrategyEvaluation
 
 class StrategyEvaluator:
@@ -50,13 +51,31 @@ class StrategyEvaluator:
             "total_score": round(total_score, 2)
         }
 
-    def evaluate(self, strategy_id: str, performance: PerformanceMetric, window_start: datetime, window_end: datetime) -> StrategyEvaluation:
-        """评估单个策略表现，生成 StrategyEvaluation 记录"""
+    def evaluate(
+        self,
+        strategy_id: str,
+        performance: PerformanceMetric,
+        window_start: datetime,
+        window_end: datetime,
+        evaluation_date: Optional[datetime] = None
+    ) -> StrategyEvaluation:
+        """评估单个策略表现，生成 StrategyEvaluation 记录
+        
+        Args:
+            strategy_id: 策略ID
+            performance: 性能指标
+            window_start: 评估窗口开始时间
+            window_end: 评估窗口结束时间
+            evaluation_date: 评估时间戳，如果为None则使用当前UTC时间
+        """
         scores = self.calculate_scores(performance)
+        
+        # 使用传入的 evaluation_date，如果没有则使用当前UTC时间
+        eval_date = evaluation_date if evaluation_date is not None else datetime.now(timezone.utc)
         
         return StrategyEvaluation(
             strategy_id=strategy_id,
-            evaluation_date=datetime.utcnow(),
+            evaluation_date=eval_date,
             window_start=window_start,
             window_end=window_end,
             
