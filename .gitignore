@@ -82,21 +82,7 @@ verify_*.py
 # ── Misc project-local files ──────────────────────────────────────────────────
 review_*.txt
 review_*.py
-*报告.md
-*需求拆解*.md
-技术债务记录*.txt
-智能体Skill系统使用指南.md
-界面功能复查与协调.txt
-Skill*.txt
-prompt认知.txt
-完整调研*.txt
-调研*.txt
-策略组合功能实现文档.md
 backend/backend/
-
-# ── Research reports (local only, never push to GitHub) ─────────────────────
-research_report_*.md
-research_plan_*.md
 
 # ── Backup & temp files ──────────────────────────────────────────────────────
 *.backup
@@ -105,7 +91,15 @@ research_plan_*.md
 fix_*.js
 fix_*.py
 
-# ── Local Docs & Specs ──
-docs/
-specs*/
+# ── Local Docs & Specs (local only, not pushed to GitHub) ──
+/docs/
 
+# ── Root-level screenshots & debugging artifacts ──
+/*.png
+/*.jpg
+/*.jpeg
+tmp_*.txt
+temp_*.txt
+
+# ── Developer-specific configuration ──
+config/mcporter.json
