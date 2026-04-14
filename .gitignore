@@ -103,3 +103,15 @@ temp_*.txt
 
 # ── Developer-specific configuration ──
 config/mcporter.json
+
+# ── Frontend build cache & temp directories ──
+frontend/.swc/
+frontend/DDesktopQuantAgentfrontend/
+
+# ── Test output files ──
+test_output*.txt
+backend/test_output*.txt
+
+# ── Personal notes & checklists ──
+焚诀.md
+WFA功能问题清单.txt
