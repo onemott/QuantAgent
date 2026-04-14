@@ -3,6 +3,9 @@ import pandas as pd
 from numba import njit, float64, int64
 from typing import Dict, Any, List, Tuple
 
+from app.services.backtester.annualization import annualize_return, annualize_sharpe, infer_annualization_factor
+from app.services.backtester.signal_resolution import resolve_signal_output
+
 @njit(cache=True)
 def _numba_core_loop(
     prices: np.ndarray, 
@@ -113,26 +116,20 @@ class EventDrivenBacktester:
         self.commission = commission
 
     def run(self) -> Dict[str, Any]:
-        # 1. Generate Signals (Python/Pandas)
-        import inspect
-        import asyncio
-        signals = self.signal_func(self.df)
-        if inspect.isawaitable(signals):
-            try:
-                loop = asyncio.get_event_loop()
-                signals = loop.run_until_complete(signals)
-            except Exception:
-                signals = asyncio.run(signals)
+        signals = resolve_signal_output(self.signal_func(self.df))
         
         # 2. Prepare Data for Numba
         # Ensure contiguous arrays of correct type
         prices = self.df['close'].values.astype(np.float64)
         # Handle NaN in signals if any
         sigs = signals.fillna(0).values.astype(np.int64)
+        shifted_sigs = np.zeros_like(sigs)
+        if len(sigs) > 1:
+            shifted_sigs[1:] = sigs[:-1]
         
         # 3. Run Numba Core Loop
         equity, trades_arr, total_commission, final_capital = _numba_core_loop(
-            prices, sigs, self.initial_capital, self.commission
+            prices, shifted_sigs, self.initial_capital, self.commission
         )
         
         # 4. Process Results
@@ -140,25 +137,21 @@ class EventDrivenBacktester:
         
         # Metrics
         total_return = (final_capital / self.initial_capital - 1) * 100
+        annualization_factor = infer_annualization_factor(self.df.index)
+        returns = equity_curve.pct_change().dropna()
         
-        # Annual Return
-        if len(self.df) > 0:
-            n_days = (self.df.index[-1] - self.df.index[0]).days
-            annual_return = ((1 + total_return / 100) ** (365 / n_days) - 1) * 100 if n_days > 0 else 0.0
-        else:
-            annual_return = 0.0
+        annual_return = annualize_return(
+            total_return / 100,
+            len(returns),
+            annualization_factor
+        )
         
         # Max Drawdown
         rolling_max = equity_curve.cummax()
         drawdown = (equity_curve - rolling_max) / rolling_max
         max_drawdown = abs(drawdown.min()) * 100
         
-        # Sharpe Ratio
-        returns = equity_curve.pct_change().dropna()
-        if returns.std() > 0:
-            sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(365)
-        else:
-            sharpe_ratio = 0.0
+        sharpe_ratio = annualize_sharpe(returns, annualization_factor)
             
         # Trade Stats
         trades_df = pd.DataFrame(trades_arr, columns=['entry_idx', 'exit_idx', 'entry_price', 'exit_price', 'pnl', 'pnl_pct', 'quantity'])

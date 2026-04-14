@@ -96,14 +96,14 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
             limit=500000
         )
         
-        if df is None or len(df) < 50:
+        if df is None or len(df) < 300:
             async with get_db() as session_db:
                 stmt = select(WFOSession).where(WFOSession.id == session_id)
                 result = await session_db.execute(stmt)
                 session_obj = result.scalar_one_or_none()
                 if session_obj:
                     session_obj.status = "failed"
-                    session_obj.error_message = f"ClickHouse 中 {symbol_clean} {req.interval} 的历史数据不足，请先补充数据。"
+                    session_obj.error_message = f"ClickHouse 中 {symbol_clean} {req.interval} 的历史数据不足（当前 {len(df) if df is not None else 0} 根，至少需要 300 根），请先补充数据。"
                     await session_db.commit()
             return
 
@@ -122,6 +122,7 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
         wfo_result = await optimizer.run_wfo(
             is_days=req.is_days,
             oos_days=req.oos_days,
+            step_days=req.step_days,
             n_trials=req.n_trials,
             use_numba=req.use_numba,
             embargo_days=req.embargo_days

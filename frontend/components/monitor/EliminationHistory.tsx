@@ -23,6 +23,9 @@ interface EliminationRecord {
 
 interface EliminationHistoryProps {
   className?: string;
+  sessionId?: string;  // Optional: filter by replay session
+  isRunning?: boolean; // Whether the replay is currently running
+  data?: EliminationRecord[];  // Optional: external data (used for shared polling)
 }
 
 // ─── Helper Functions ─────────────────────────────────────────────────────────
@@ -53,30 +56,60 @@ const formatReason = (reason: string): string => {
 };
 
 // ─── Component ────────────────────────────────────────────────────────────────
-export function EliminationHistory({ className }: EliminationHistoryProps) {
+export function EliminationHistory({ className, sessionId, isRunning, data }: EliminationHistoryProps) {
   const [records, setRecords] = useState<EliminationRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Use external data if provided, otherwise use internal polling
   useEffect(() => {
-    const fetchHistory = async () => {
-      setLoading(true);
+    if (data !== undefined) {
+      // External data provided - use it directly (take first 20 for display)
+      setRecords(data.slice(0, 20));
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    // No external data - use internal polling logic
+    const abortController = new AbortController();
+    
+    const fetchHistory = async (isPolling = false) => {
+      // Clear old data when not polling (sessionId switched)
+      if (!isPolling) {
+        setRecords([]);
+        setLoading(true);
+      }
       setError(null);
       try {
+        // Build URL with optional session_id filter
+        const params = new URLSearchParams({ limit: "20" });
+        if (sessionId) {
+          params.set("session_id", sessionId);
+        }
         const res = await fetch(
-          "/api/v1/dynamic-selection/history?limit=20"
+          `/api/v1/dynamic-selection/history?${params.toString()}`,
+          { signal: abortController.signal }
         );
         if (!res.ok) {
           console.warn(`获取历史记录失败：服务器返回 ${res.status}`);
-          setError(`无法加载历史记录：服务器返回 ${res.status}`);
+          if (!isPolling) setError(`无法加载历史记录：服务器返回 ${res.status}`);
           setRecords([]);
           return;
         }
-        const data: EliminationRecord[] = await res.json();
-        setRecords(Array.isArray(data) ? data : []);
-      } catch (err) {
+        const data = await res.json();
+        // Validate response is an array
+        if (!Array.isArray(data)) {
+          console.warn("EliminationHistory: API返回非数组类型", typeof data);
+          setRecords([]);
+          return;
+        }
+        setRecords(data);
+      } catch (err: any) {
+        // Ignore abort errors
+        if (err.name === 'AbortError') return;
         console.warn("获取历史记录失败:", err);
-        setError("后端服务未连接，无法加载历史记录");
+        if (!isPolling) setError("后端服务未连接，无法加载历史记录");
         setRecords([]);
       } finally {
         setLoading(false);
@@ -84,7 +117,17 @@ export function EliminationHistory({ className }: EliminationHistoryProps) {
     };
 
     fetchHistory();
-  }, []);
+    
+    let intervalId: NodeJS.Timeout | null = null;
+    if (isRunning) {
+      intervalId = setInterval(() => fetchHistory(true), 5000);
+    }
+    
+    return () => {
+      abortController.abort();
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [sessionId, isRunning, data]);
 
   return (
     <Card className={`bg-slate-900 border-slate-700/50 ${className || ""}`}>
@@ -222,3 +265,5 @@ export function EliminationHistory({ className }: EliminationHistoryProps) {
     </Card>
   );
 }
+
+export default EliminationHistory;

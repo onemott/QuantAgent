@@ -3,6 +3,7 @@ Tests for data_source tagging and filtering in analytics endpoints.
 """
 
 import pytest
+from contextlib import asynccontextmanager
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
@@ -42,7 +43,7 @@ class TestDataSourceFiltering:
         with patch("app.services.performance_service.performance_service.calculate_metrics", new_callable=AsyncMock) as mock_calc:
             mock_calc.return_value = mock_metrics
 
-            from app.main import app
+            from main import app
             from app.services.database import get_db
 
             # Override get_db with a mock
@@ -60,10 +61,8 @@ class TestDataSourceFiltering:
             try:
                 transport = ASGITransport(app=app)
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
-                    # Default: include_mock=False
                     response = await client.get("/api/v1/analytics/performance?period=all_time")
-                    # Should not raise 500, at minimum returns something
-                    assert response.status_code in (200, 500)
+                    assert response.status_code == 200
             finally:
                 app.dependency_overrides.clear()
 
@@ -81,7 +80,7 @@ class TestDataSourceFiltering:
         with patch("app.services.performance_service.performance_service.calculate_metrics", new_callable=AsyncMock) as mock_calc:
             mock_calc.return_value = mock_metrics
 
-            from app.main import app
+            from main import app
             from app.services.database import get_db
 
             mock_db = AsyncMock()
@@ -99,7 +98,7 @@ class TestDataSourceFiltering:
                 transport = ASGITransport(app=app)
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
                     response = await client.get("/api/v1/analytics/performance?period=all_time&include_mock=true")
-                    assert response.status_code in (200, 500)
+                    assert response.status_code == 200
             finally:
                 app.dependency_overrides.clear()
 
@@ -110,8 +109,8 @@ class TestReplayBacktestComparison:
     @pytest.mark.asyncio
     async def test_comparison_with_explicit_backtest_id(self):
         """Comparison uses explicit backtest_id when provided."""
-        from app.main import app
-        from app.services.database import get_db
+        from main import app
+        from app.services.database import get_db_session
 
         mock_db = AsyncMock()
         mock_result = MagicMock()
@@ -122,15 +121,13 @@ class TestReplayBacktestComparison:
         async def override_get_db():
             yield mock_db
 
-        app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[get_db_session] = override_get_db
 
         try:
             transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://test") as client:
-                # No replay session found case
                 response = await client.get("/api/v1/analytics/replay-backtest-comparison?backtest_id=1")
-                # Should return error or empty comparison gracefully
-                assert response.status_code in (200, 404, 500)
+                assert response.status_code in (200, 404)
                 if response.status_code == 200:
                     data = response.json()
                     assert "comparisons" in data or "error" in data
@@ -161,6 +158,75 @@ class TestReplayBacktestComparison:
             "win_rate", "profit_factor", "total_trades", "final_equity", "var_95"
         ]
         assert len(expected_metrics) >= 10
+
+
+class TestReplayQuickBacktest:
+    @pytest.mark.asyncio
+    async def test_quick_backtest_accepts_dict_equity_curve(self, monkeypatch):
+        from app.api.v1.endpoints import analytics as analytics_module
+
+        replay = MagicMock()
+        replay.symbol = "BTCUSDT"
+        replay.strategy_type = "ma"
+        replay.params = {"interval": "1d", "fast_period": 5, "slow_period": 20}
+        replay.start_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        replay.end_time = datetime(2024, 1, 31, tzinfo=timezone.utc)
+        replay.status = "completed"
+        replay.initial_capital = 100000.0
+
+        execute_result = MagicMock()
+        execute_result.scalar_one_or_none.return_value = replay
+
+        class FakeSession:
+            def __init__(self):
+                self.added = None
+
+            async def execute(self, stmt):
+                return execute_result
+
+            def add(self, obj):
+                self.added = obj
+
+            async def flush(self):
+                if self.added is not None:
+                    self.added.id = 123
+
+            async def commit(self):
+                return None
+
+        fake_session = FakeSession()
+
+        @asynccontextmanager
+        async def fake_get_db():
+            yield fake_session
+
+        monkeypatch.setattr(analytics_module, "get_db", fake_get_db)
+
+        df = MagicMock()
+        df.__len__.return_value = 300
+        with patch("app.services.binance_service.binance_service.get_klines_dataframe", new=AsyncMock(return_value=df)), \
+             patch("app.services.strategy_templates.get_template") as mock_template, \
+             patch("app.services.strategy_templates.build_signal_func", return_value=lambda data: None), \
+             patch("app.api.v1.endpoints.strategy._run_backtest_engine") as mock_engine:
+            mock_template.return_value = {"name": "ma"}
+            mock_engine.return_value = {
+                "total_return": 5.0,
+                "annual_return": 10.0,
+                "max_drawdown": 2.0,
+                "sharpe_ratio": 1.2,
+                "win_rate": 60.0,
+                "profit_factor": 1.5,
+                "total_trades": 1,
+                "total_commission": 10.0,
+                "final_capital": 105000.0,
+                "equity_curve": [{"t": "2024-01-01", "v": 100000.0}, {"t": "2024-01-02", "v": 105000.0}],
+                "trades": [{"entry_time": "2024-01-01", "entry_price": 100.0, "exit_time": "2024-01-02", "exit_price": 105.0, "pnl": 5.0}],
+            }
+
+            result = await analytics_module.replay_quick_backtest("replay-1")
+
+        assert result["backtest_id"] == 123
+        assert result["equity_curve_sample"][0]["v"] == 100000.0
 
 
 class TestParamsHashComputation:

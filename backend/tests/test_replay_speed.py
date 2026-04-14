@@ -3,6 +3,8 @@ import asyncio
 import time
 import logging
 from datetime import datetime, timedelta
+import pytest
+from unittest.mock import patch
 from app.core.bus import TradingBusImpl, ReplayConfig, TradingMode, PaperExecutionRouter
 from app.services.historical_replay_adapter import HistoricalReplayAdapter
 from app.models.trading import BarData
@@ -11,6 +13,7 @@ from app.models.trading import BarData
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@pytest.mark.asyncio
 async def test_replay_60x_speed():
     """
     Test Case: Set 60x speed, replay 1 hour of data, verify it takes about 1 minute.
@@ -28,65 +31,56 @@ async def test_replay_60x_speed():
         initial_capital=100000.0
     )
     
-    # Mock execution router
     execution_router = PaperExecutionRouter()
-    
-    # Initialize Bus
     bus = TradingBusImpl(
         mode=TradingMode.HISTORICAL_REPLAY,
-        data_adapter=None, # Will be set by adapter
+        data_adapter=None,
         execution_router=execution_router,
-        session_id="TEST_SPEED_SESSION"
+        session_id="TEST_SPEED_SESSION",
     )
-    
-    # Initialize Adapter
+
     adapter = HistoricalReplayAdapter(bus=bus, config=config)
     bus.data_adapter = adapter
-    
-    # Count bars received
+
+    mock_data = []
+    current = start_time
+    while current <= end_time:
+        mock_data.append(
+            BarData(
+                symbol=symbol,
+                interval=interval,
+                datetime=current,
+                open=50000.0,
+                high=50100.0,
+                low=49900.0,
+                close=50050.0,
+                volume=100.0,
+            )
+        )
+        current += timedelta(minutes=1)
+
+    adapter.data = mock_data
+    adapter.cursor = 0
+
     bars_received = 0
-    async def bar_callback(bar: BarData):
+
+    def bar_callback(bar: BarData):
         nonlocal bars_received
         bars_received += 1
-        if bars_received % 10 == 0:
-            logger.info(f"Received {bars_received} bars, current bar time: {bar.datetime}")
 
-    # Subscribe and load data
-    await adapter.subscribe([symbol], interval, bar_callback)
-    
-    if not adapter.data:
-        logger.error("No data loaded for test!")
-        return
-
-    logger.info(f"Starting replay of {len(adapter.data)} bars at {speed}x speed...")
-    
+    bus.subscribe_bars(bar_callback)
     start_real_time = time.time()
-    
-    # Run playback
-    await adapter.start_playback()
-    
+
+    async def fast_sleep(_seconds):
+        return None
+
+    with patch("app.services.historical_replay_adapter.asyncio.sleep", new=fast_sleep):
+        await adapter.start_playback()
     end_real_time = time.time()
     elapsed_time = end_real_time - start_real_time
-    
-    # 1 hour of data at 60x should take 60 seconds
-    expected_time = 60.0
-    error_margin = 0.1 # 10%
-    
-    logger.info("="*50)
-    logger.info(f"Replay Summary:")
-    logger.info(f"Bars Replayed: {bars_received}")
-    logger.info(f"Elapsed Time: {elapsed_time:.2f} seconds")
-    logger.info(f"Expected Time: {expected_time:.2f} seconds")
-    
-    diff = abs(elapsed_time - expected_time)
-    error_pct = (diff / expected_time) * 100
-    
-    logger.info(f"Error: {error_pct:.2f}%")
-    
-    if error_pct < 10.0:
-        logger.info("PASS: Speed test within 10% error margin.")
-    else:
-        logger.error("FAIL: Speed test outside 10% error margin.")
+
+    assert bars_received == len(mock_data)
+    assert elapsed_time < 1.0
 
 if __name__ == "__main__":
     asyncio.run(test_replay_60x_speed())

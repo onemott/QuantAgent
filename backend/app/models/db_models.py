@@ -621,9 +621,11 @@ class SelectionHistory(Base):
     __table_args__ = (
         Index("idx_selection_history_date", "evaluation_date"),
         Index("idx_selection_history_created", "created_at"),
+        Index("idx_selection_history_session", "session_id"),
     )
     
     id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(50), nullable=True)
     evaluation_date = Column(DateTime(timezone=True), nullable=False)
     
     # 策略池状态

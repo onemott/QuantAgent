@@ -2,12 +2,13 @@ import os
 import sys
 import pytest
 from decimal import Decimal
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.paper_trading_service import PaperTradingService
-from app.models.db_models import PaperPosition, PaperTrade
+from app.models.db_models import EquitySnapshot, PaperAccountReplay, PaperPosition, PaperTrade
 
 
 @pytest.mark.asyncio
@@ -137,3 +138,79 @@ async def test_match_orders_passes_order_leverage():
 
     assert svc._apply_fill_to_account.await_count == 1
     assert svc._apply_fill_to_account.await_args.kwargs["leverage"] == 9
+
+
+def _scalar_result(value):
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = value
+    result.scalar.return_value = value
+    return result
+
+
+def _scalars_result(first=None, all_items=None):
+    scalars = MagicMock()
+    scalars.first.return_value = first
+    scalars.all.return_value = all_items or []
+    result = MagicMock()
+    result.scalars.return_value = scalars
+    return result
+
+
+@pytest.mark.asyncio
+async def test_record_replay_equity_snapshot_uses_signed_value_for_short_position():
+    svc = PaperTradingService()
+    timestamp = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    account = PaperAccountReplay(
+        session_id="S1",
+        total_usdt=Decimal("150000"),
+        initial_capital=Decimal("100000"),
+    )
+    short_position = PaperPosition(
+        symbol="BTCUSDT",
+        session_id="S1",
+        quantity=Decimal("-1"),
+        avg_price=Decimal("50000"),
+        leverage=3,
+    )
+    prev_snapshot = EquitySnapshot(
+        session_id="S1",
+        total_equity=Decimal("105000"),
+        cash_balance=Decimal("150000"),
+        position_value=Decimal("-45000"),
+        daily_pnl=Decimal("0"),
+        daily_return=Decimal("0"),
+        drawdown=Decimal("0"),
+        initial_capital=Decimal("100000"),
+        timestamp=datetime(2024, 1, 1, 11, 0, tzinfo=timezone.utc),
+        data_source="REPLAY",
+    )
+
+    execute_results = [
+        _scalars_result(first=None),
+        _scalar_result(account),
+        _scalars_result(all_items=[short_position]),
+        _scalar_result(prev_snapshot),
+        _scalar_result(Decimal("110000")),
+    ]
+
+    added_snapshots = []
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(side_effect=execute_results)
+    mock_session.add = MagicMock(side_effect=lambda obj: added_snapshots.append(obj))
+
+    mock_db = AsyncMock()
+    mock_db.__aenter__.return_value = mock_session
+
+    with patch("app.services.paper_trading_service.get_db", return_value=mock_db):
+        created = await svc.record_replay_equity_snapshot(
+            session_id="S1",
+            timestamp=timestamp,
+            current_prices={"BTCUSDT": 51000.0},
+        )
+
+    assert created is True
+    snapshot = next(obj for obj in added_snapshots if isinstance(obj, EquitySnapshot))
+    assert snapshot.position_value == Decimal("-51000")
+    assert snapshot.total_equity == Decimal("99000")
+    assert snapshot.daily_pnl == Decimal("-6000")
+    assert snapshot.drawdown == Decimal("10")

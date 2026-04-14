@@ -4,7 +4,8 @@ Provides performance metrics, equity curve, trade pairs, and position analysis.
 """
 
 import logging
-from fastapi import APIRouter, HTTPException, Query
+from contextlib import asynccontextmanager
+from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,10 +15,11 @@ from app.services.performance_service import performance_service
 from app.services.trade_pair_service import trade_pair_service
 from app.services.position_analysis_service import position_analysis_service
 from app.services.paper_trading_service import paper_trading_service
-from app.services.database import get_db, redis_get, redis_set
+from app.services.database import get_db, get_db_session, redis_get, redis_set
 from app.models.db_models import EquitySnapshot, PaperTrade, ReplaySession
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,11 @@ REDIS_PERF_KEY = "analytics:performance:{period}"
 REDIS_EQUITY_KEY = "analytics:equity:{period}"
 REDIS_PORTFOLIO_KEY = "analytics:portfolio"
 CACHE_TTL = 30  # 30 seconds cache
+
+
+@asynccontextmanager
+async def _reuse_session(db: AsyncSession):
+    yield db
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,8 +634,8 @@ async def replay_quick_backtest(replay_session_id: str):
         symbol_ccxt, interval, limit=limit, start=start_time, end=end_time
     )
 
-    if df is None or len(df) < 50:
-        raise HTTPException(status_code=400, detail="回测数据不足（需要至少 50 根 K 线）")
+    if df is None or len(df) < 300:
+        raise HTTPException(status_code=400, detail=f"回测数据不足：当前 {len(df) if df is not None else 0} 根 K 线，至少需要 300 根")
 
     if len(df) < 20:
         raise HTTPException(status_code=400, detail="回测区间内数据不足（需要至少 20 根 K 线）")
@@ -658,11 +665,15 @@ async def replay_quick_backtest(replay_session_id: str):
 
     # 6. 构造 equity curve（downsampled）
     equity_values = result["equity_curve"]
-    step = max(1, len(equity_values) // 500)
-    equity_curve = [
-        {"t": str(df.index[i])[:19], "v": round(equity_values[i], 2)}
-        for i in range(0, len(equity_values), step)
-    ]
+    if equity_values and isinstance(equity_values[0], dict):
+        step = max(1, len(equity_values) // 500)
+        equity_curve = equity_values[::step]
+    else:
+        step = max(1, len(equity_values) // 500)
+        equity_curve = [
+            {"t": str(df.index[i])[:19], "v": round(equity_values[i], 2)}
+            for i in range(0, len(equity_values), step)
+        ]
 
     # 7. 构造 markers
     trades_list = result["trades"]
@@ -742,6 +753,7 @@ async def get_replay_backtest_comparison(
     symbol: Optional[str] = Query(None, description="Filter by symbol (e.g. BTCUSDT)"),
     limit: int = Query(10, ge=1, le=50, description="Max comparisons to return"),
     include_mock: bool = Query(False, description="Include mock data"),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     获取回放与回测的详细对比数据。
@@ -749,11 +761,10 @@ async def get_replay_backtest_comparison(
     匹配优先级：explicit backtest_id > params_hash exact match > symbol+strategy_type fuzzy match
     """
     from app.models.db_models import BacktestResult, PaperTrade, ReplaySession
-    from app.services.database import get_db
     from app.services.replay_metrics_service import replay_metrics_service
     import hashlib, json
 
-    async with get_db() as session:
+    async with _reuse_session(db) as session:
         # 1. Resolve replay session
         if replay_session_id:
             stmt = select(ReplaySession).where(ReplaySession.replay_session_id == replay_session_id)

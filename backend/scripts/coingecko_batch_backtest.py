@@ -121,7 +121,8 @@ def run_single_backtest(
     timeframe: str = "1d",
 ) -> Optional[Dict[str, Any]]:
     """对单个 DataFrame 运行回测，返回结果字典"""
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 300:
+        print(f"⚠️  {symbol}: 数据不足（{len(df) if df is not None else 0} 根 < 300 根），跳过")
         return None
     try:
         bt = Backtest(

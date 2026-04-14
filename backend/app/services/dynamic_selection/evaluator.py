@@ -11,10 +11,12 @@ class StrategyEvaluator:
         计算综合得分（0-100分）
         包含：收益能力(30%)、风险控制(25%)、风险调整收益(25%)、稳定性(10%)、交易效率(10%)
         """
-        annual_return = float(performance.annualized_return or 0) / 100.0
-        max_drawdown = float(performance.max_drawdown_pct or 0) / 100.0
+        # VirtualBus outputs metrics in decimal format (e.g., 0.05 = 5%)
+        # No conversion needed - use values directly
+        annual_return = float(performance.annualized_return or 0)
+        max_drawdown = float(performance.max_drawdown_pct or 0)
         sharpe_ratio = float(performance.sharpe_ratio or 0)
-        win_rate = float(performance.win_rate or 0) / 100.0
+        win_rate = float(performance.win_rate or 0)
         num_trades = int(performance.total_trades or 0)
         
         # 1. 收益能力得分（0-30分）
@@ -79,15 +81,15 @@ class StrategyEvaluator:
             window_start=window_start,
             window_end=window_end,
             
-            # Base performance
-            total_return=float(performance.total_return or 0) / 100.0,
-            annual_return=float(performance.annualized_return or 0) / 100.0,
-            volatility=float(performance.volatility or 0) / 100.0,
-            max_drawdown=float(performance.max_drawdown_pct or 0) / 100.0,
+            # Base performance (VirtualBus outputs in decimal format, no conversion needed)
+            total_return=float(performance.total_return or 0),
+            annual_return=float(performance.annualized_return or 0),
+            volatility=float(performance.volatility or 0),
+            max_drawdown=float(performance.max_drawdown_pct or 0),
             sharpe_ratio=float(performance.sharpe_ratio or 0),
             sortino_ratio=float(performance.sortino_ratio or 0),
             calmar_ratio=float(performance.calmar_ratio or 0),
-            win_rate=float(performance.win_rate or 0) / 100.0,
+            win_rate=float(performance.win_rate or 0),
             num_trades=int(performance.total_trades or 0),
             
             # Scores

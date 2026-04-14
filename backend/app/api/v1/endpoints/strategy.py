@@ -20,6 +20,8 @@ from app.services.clickhouse_service import clickhouse_service
 from app.services.database import get_db
 from app.models.db_models import BacktestResult, OptimizationResult
 from app.services.backtester import GridOptimizer, OptunaOptimizer
+from app.services.backtester.annualization import annualize_return, annualize_sharpe, infer_annualization_factor
+from app.services.backtester.signal_resolution import resolve_signal_output
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -232,8 +234,8 @@ async def run_backtest(req: BacktestRequest):
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Failed to fetch market data: {e}")
 
-    if df is None or len(df) < 50:
-        raise HTTPException(status_code=400, detail="Not enough candle data to run backtest (need ≥50)")
+    if df is None or len(df) < 300:
+        raise HTTPException(status_code=400, detail=f"历史K线数据不足：当前 {len(df) if df is not None else 0} 根，至少需要 300 根才能执行回测")
 
     # Run backtest engine (EventDrivenBacktester with Numba)
     try:
@@ -495,20 +497,7 @@ def _run_backtest_engine(
     """
     import numpy as np
 
-    import inspect
-    signals = signal_func(df)
-    if inspect.isawaitable(signals):
-        # We need to run it synchronously
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # This should not happen in _run_backtest_engine if called correctly, 
-                # but let's be safe.
-                import nest_asyncio
-                nest_asyncio.apply()
-            signals = loop.run_until_complete(signals)
-        except Exception:
-            signals = asyncio.run(signals)
+    signals = resolve_signal_output(signal_func(df))
     
     from app.services.paper_trading_service import SLIPPAGE_PCT
     slippage_pct = float(SLIPPAGE_PCT)
@@ -524,10 +513,11 @@ def _run_backtest_engine(
 
     prices = df["close"]
     times  = df.index
+    execution_signals = signals.shift(1).fillna(0).astype(int)
 
     for i in range(len(df)):
         price  = float(prices.iloc[i])
-        signal = int(signals.iloc[i]) if i < len(signals) else 0
+        signal = int(execution_signals.iloc[i]) if i < len(execution_signals) else 0
         current_time = times[i]
 
         # 权益计算使用市场价（不含滑点）
@@ -612,22 +602,15 @@ def _run_backtest_engine(
 
     # Metrics
     total_return = (final_capital / initial_capital - 1) * 100
-    n_days = (times[-1] - times[0]).days
-    annual_return = (
-        ((1 + total_return / 100) ** (365 / n_days) - 1) * 100 if n_days > 0 else 0.0
-    )
+    annualization_factor = infer_annualization_factor(times)
+    daily_ret = equity_series.pct_change().dropna()
+    annual_return = annualize_return(total_return / 100, len(daily_ret), annualization_factor)
 
     rolling_max  = equity_series.cummax()
     drawdown     = (equity_series - rolling_max) / rolling_max
     max_drawdown = abs(float(drawdown.min())) * 100
 
-    daily_ret     = equity_series.pct_change().dropna()
-    risk_free_d   = 0.02 / 365
-    excess_ret    = daily_ret - risk_free_d
-    sharpe = (
-        float((excess_ret.mean() / daily_ret.std()) * np.sqrt(365))
-        if daily_ret.std() > 0 else 0.0
-    )
+    sharpe = annualize_sharpe(daily_ret, annualization_factor)
 
     n_trades = len(trades)
     if n_trades > 0:
@@ -755,8 +738,8 @@ async def optimize_strategy(req: OptimizeRequest):
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to fetch market data: {e}")
 
-    if df is None or len(df) < 50:
-        raise HTTPException(status_code=400, detail="K线数据不足（至少需要 50 根）")
+    if df is None or len(df) < 300:
+        raise HTTPException(status_code=400, detail=f"K线数据不足：当前 {len(df) if df is not None else 0} 根，至少需要 300 根")
 
     # Run Optimization
     if req.algorithm == "optuna":
@@ -919,10 +902,10 @@ async def batch_backtest(req: BatchBacktestRequest):
             df = await binance_service.get_klines_dataframe(
                 symbol_ccxt, req.interval, limit=effective_limit
             )
-            if df is None or len(df) < 50:
+            if df is None or len(df) < 300:
                 return BatchBacktestItem(symbol=symbol_clean, total_return=0, annual_return=0,
                                          sharpe_ratio=0, max_drawdown=0, win_rate=0,
-                                         total_trades=0, error="数据不足")
+                                         total_trades=0, error=f"数据不足（当前 {len(df) if df is not None else 0} 根，需要 300 根）")
             sig_func = build_signal_func(req.strategy_type, req.params)
             result   = await asyncio.get_event_loop().run_in_executor(
                 None,

@@ -24,12 +24,12 @@ def test_evaluator_scoring():
     total_trades = len(trade_pairs)
     win_rate = sum(1 for tp in trade_pairs if tp.pnl > 0) / total_trades
     
-    # 基于 TradePair 构造 PerformanceMetric (模拟 performance_service.py 的百分比输出)
+    # 基于 TradePair 构造 PerformanceMetric (VirtualBus 输出小数格式)
     perf = PerformanceMetric(
-        annualized_return=10.0,  # 10% 以 10.0 存储
-        max_drawdown_pct=15.0,   # 15% 以 15.0 存储
+        annualized_return=0.10,  # 10% 以小数 0.10 存储
+        max_drawdown_pct=0.15,   # 15% 以小数 0.15 存储
         sharpe_ratio=1.5,
-        win_rate=win_rate * 100, # 75.0%
+        win_rate=win_rate,       # 0.75 (75%)
         total_trades=total_trades # 4
     )
     

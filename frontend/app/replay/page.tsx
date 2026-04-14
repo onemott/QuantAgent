@@ -14,7 +14,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { DateRangePicker, generateQuickRanges } from "@/components/ui/date-range-picker";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -26,6 +26,9 @@ import { EquityCurveChart, TradeMarker } from "@/components/charts/EquityCurveCh
 import KlineChart from "@/components/charts/KlineChart";
 import TradeList from "@/components/charts/TradeList";
 import PositionPanel from "@/components/charts/PositionPanel";
+import { AtomicStrategyPanel, AtomicStrategyConfig, StrategyTemplate } from "@/components/replay/AtomicStrategyPanel";
+import EliminationHistory from "@/components/monitor/EliminationHistory";
+import WeightEvolutionChart from "@/components/replay/WeightEvolutionChart";
 
 // Dynamic import with SSR disabled to avoid hydration mismatch with localStorage state
 const ReplayContent = dynamic(() => Promise.resolve(ReplayContentWithHydrationFix), {
@@ -34,10 +37,6 @@ const ReplayContent = dynamic(() => Promise.resolve(ReplayContentWithHydrationFi
 });
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-interface StrategyTemplate {id: string;name: string;description: string;params: {key: string;label: string;
-    type: "int" | "float";default: number;min: number;max: number;step?: number;description?: string;
-  }[];supports_replay?: boolean;  // 标记是否支持历史回放
-}
 
 interface ReplaySession {replay_session_id: string;strategy_id: number;symbol: string;start_time: string;end_time: string;speed: number;initial_capital: number;status: "pending" | "running" | "paused" | "completed" | "failed";current_timestamp?: string;created_at: string;is_saved?: boolean;
 }
@@ -74,6 +73,22 @@ interface ReplayTradeStats {replay_session_id: string;total_trades: number;winni
   returns_pct: number;
 }
 
+// Dynamic Selection History Record (shared between EliminationHistory and WeightEvolutionChart)
+interface DynamicSelectionHistoryRecord {
+  id: number;
+  evaluation_date: string;
+  total_strategies: number;
+  surviving_count: number;
+  eliminated_count: number;
+  eliminated_strategy_ids: string[];
+  elimination_reasons: Record<string, string>;
+  strategy_weights: Record<string, number>;
+  expected_return: number;
+  expected_volatility: number;
+  expected_sharpe: number;
+  created_at: string;
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 const SYMBOLS = [
   { value: "BTCUSDT", label: "BTC/USDT" }, { value: "ETHUSDT", label: "ETH/USDT" },
@@ -106,6 +121,7 @@ const STRATEGY_INTERVAL_MAP: Record<string, { interval: string; label: string }>
   "ichimoku":    { interval: "4h", label: "4小时" },
   "smart_beta":  { interval: "1h", label: "1小时" },
   "basis":       { interval: "1h", label: "1小时" },
+  "dynamic_selection": { interval: "1m", label: "1分钟" },
 };
 
 // 快速预设方案
@@ -313,7 +329,27 @@ function ReplayContentWithHydrationFix() {
   
   // Warning Panel State
   const [showWarningPanel, setShowWarningPanel] = useState(false);
-  
+
+  // Atomic Strategy Panel State (for dynamic_selection)
+  const [atomicStrategies, setAtomicStrategies] = useState<AtomicStrategyConfig[]>([
+    { strategy_id: "ds_ma_1", strategy_type: "ma", params: { fast_period: 10, slow_period: 30 } },
+    { strategy_id: "ds_rsi_1", strategy_type: "rsi", params: { rsi_period: 14, oversold: 30, overbought: 70 } },
+  ]);
+  const [evaluationPeriod, setEvaluationPeriod] = useState(1440);
+  const [weightMethod, setWeightMethod] = useState("score_based");
+  const [compositionThreshold, setCompositionThreshold] = useState(0.5);
+  const [eliminationRule, setEliminationRule] = useState({
+    min_score_threshold: 40.0,
+    elimination_ratio: 0.2,
+    min_consecutive_low: 3,
+    low_score_threshold: 30.0,
+    min_strategies: 2,
+  });
+  const [perStrategyCapital, setPerStrategyCapital] = useState<number | undefined>(undefined);
+
+  // Dynamic Selection History Data (shared between EliminationHistory and WeightEvolutionChart)
+  const [dynamicSelectionHistory, setDynamicSelectionHistory] = useState<DynamicSelectionHistoryRecord[]>([]);
+
   // ─── Hydration-safe state ────────────────────────────────────────────────────
   // Use isMounted to prevent hydration mismatch for state restored from localStorage
   const [isMounted, setIsMounted] = useState(false);useEffect(() => {setIsMounted(true);
@@ -350,7 +386,17 @@ function ReplayContentWithHydrationFix() {
           setInterval(storeState.session.interval);
         }
         if (storeState.session.params) {
-          setParamValues(storeState.session.params);
+          if (storeState.session.strategy_type === "dynamic_selection") {
+            const p = storeState.session.params;
+            if (p.atomic_strategies) setAtomicStrategies(p.atomic_strategies);
+            if (p.evaluation_period) setEvaluationPeriod(p.evaluation_period);
+            if (p.weight_method) setWeightMethod(p.weight_method);
+            if (p.composition_threshold) setCompositionThreshold(p.composition_threshold);
+            if (p.elimination_rule) setEliminationRule(p.elimination_rule);
+            if (p.per_strategy_capital !== undefined) setPerStrategyCapital(p.per_strategy_capital);
+          } else {
+            setParamValues(storeState.session.params);
+          }
         }
       }
     }
@@ -682,24 +728,91 @@ function ReplayContentWithHydrationFix() {
   const handleCreateAndStart = async () => {
     setError(null);
     try {
+      // Validation for dynamic_selection strategy
+      if (selectedType === "dynamic_selection") {
+        if (atomicStrategies.length < 2) {
+          setToast({ message: "动态选择策略需要至少 2 个原子策略", type: "error" });
+          return;
+        }
+        // Check for duplicate strategy IDs
+        const ids = atomicStrategies.map((s) => s.strategy_id);
+        const duplicates = ids.filter((item, index) => ids.indexOf(item) !== index);
+        if (duplicates.length > 0) {
+          setToast({ message: `存在重复的策略 ID: ${[...new Set(duplicates)].join(", ")}`, type: "error" });
+          return;
+        }
+        // Validate compositionThreshold range (0-1)
+        if (compositionThreshold < 0 || compositionThreshold > 1) {
+          setToast({ message: "组合阈值必须在 0 到 1 之间", type: "error" });
+          return;
+        }
+        // Validate atomic strategy params against templates
+        for (const strategy of atomicStrategies) {
+          const template = templates.find(t => t.id === strategy.strategy_type);
+          if (!template) {
+            setToast({ message: `策略类型 ${strategy.strategy_type} 未找到模板`, type: "error" });
+            return;
+          }
+          // Ensure params is not empty
+          if (!strategy.params || Object.keys(strategy.params).length === 0) {
+            setToast({ message: `策略 ${strategy.strategy_id} 的参数不能为空`, type: "error" });
+            return;
+          }
+          // Validate each param against min/max
+          for (const paramDef of template.params) {
+            const value = strategy.params[paramDef.key];
+            if (typeof value !== 'number') {
+              setToast({ message: `策略 ${strategy.strategy_id} 的参数 ${paramDef.key} 无效`, type: "error" });
+              return;
+            }
+            if (value < paramDef.min || value > paramDef.max) {
+              setToast({ message: `策略 ${strategy.strategy_id} 的参数 ${paramDef.label} 超出范围 (${paramDef.min}-${paramDef.max})`, type: "error" });
+              return;
+            }
+          }
+        }
+      }
+
       // 1. Create session
+      // Build request body based on strategy type
+      const requestBody: Record<string, any> = {
+        strategy_id: 1,
+        symbol,
+        interval,
+        start_time: dateRange.start,
+        end_time: dateRange.end,
+        speed,
+        initial_capital: initialCapital,
+        strategy_type: selectedType,
+      };
+      
+      // Build params based on strategy type
+      if (selectedType === "dynamic_selection") {
+        // For dynamic_selection, use atomic_strategies from AtomicStrategyPanel
+        requestBody.params = {
+          atomic_strategies: atomicStrategies,
+          evaluation_period: evaluationPeriod,
+          weight_method: weightMethod,
+          composition_threshold: compositionThreshold,
+          elimination_rule: eliminationRule,
+          ...(perStrategyCapital ? { per_strategy_capital: perStrategyCapital } : {}),
+        };
+      } else {
+        requestBody.params = paramValues;
+      }
+      
       const createRes = await fetch("/api/v1/replay/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          strategy_id: 1,
-          symbol,
-          interval,  // 添加 K 线周期
-          start_time: dateRange.start,
-          end_time: dateRange.end,
-          speed,
-          initial_capital: initialCapital,
-          strategy_type: selectedType,
-          params: paramValues,
-        }),
+        body: JSON.stringify(requestBody),
       });
       const createData = await createRes.json();
       if (!createRes.ok) throw new Error(createData.detail || "创建回放失败");
+
+      // Validate replay_session_id from response
+      if (!createData.replay_session_id) {
+        throw new Error("后端未返回有效的 replay_session_id");
+      }
 
       const sessionId = createData.replay_session_id;
       
@@ -724,7 +837,7 @@ function ReplayContentWithHydrationFix() {
         initial_capital: initialCapital,
         strategy_type: selectedType,
         interval,
-        params: paramValues,
+        params: requestBody.params,
         status: "running" as const,
         created_at: new Date().toISOString()
       };
@@ -734,7 +847,9 @@ function ReplayContentWithHydrationFix() {
       startStorePolling(sessionId);
       
       // 5. Auto-save params to database for sync with backtest page
-      autoSaveParams(selectedType, paramValues);
+      if (selectedType !== "dynamic_selection") {
+        autoSaveParams(selectedType, paramValues);
+      }
     } catch (e: any) {
       setError(e.message || "网络错误");
     }
@@ -1035,6 +1150,56 @@ function ReplayContentWithHydrationFix() {
       fetchHistory(1, true);
     }
   }, [showSavedOnly, statusFilter, strategyFilter]);
+
+  // Shared polling for Dynamic Selection History (used by EliminationHistory and WeightEvolutionChart)
+  // This consolidates two separate 5s polling requests into one, reducing network overhead
+  useEffect(() => {
+    const abortController = new AbortController();
+
+    const fetchDynamicSelectionHistory = async (isPolling = false) => {
+      const sessionId = safeSession?.replay_session_id;
+      if (!sessionId) {
+        if (!isPolling) setDynamicSelectionHistory([]);
+        return;
+      }
+
+      try {
+        const res = await fetch(
+          `/api/v1/dynamic-selection/history?session_id=${sessionId}&limit=100`,
+          { signal: abortController.signal }
+        );
+        if (!res.ok) {
+          console.warn(`获取动态选择历史失败：服务器返回 ${res.status}`);
+          if (!isPolling) setDynamicSelectionHistory([]);
+          return;
+        }
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          setDynamicSelectionHistory(data);
+        } else {
+          console.warn("DynamicSelectionHistory: API返回非数组类型", typeof data);
+          setDynamicSelectionHistory([]);
+        }
+      } catch (err: any) {
+        // Ignore abort errors
+        if (err.name === 'AbortError') return;
+        console.warn("获取动态选择历史失败:", err);
+        if (!isPolling) setDynamicSelectionHistory([]);
+      }
+    };
+
+    fetchDynamicSelectionHistory();
+    
+    let intervalId: number | null = null;
+    if (running && safeSession?.replay_session_id) {
+      intervalId = window.setInterval(() => fetchDynamicSelectionHistory(true), 5000);
+    }
+    
+    return () => {
+      abortController.abort();
+      if (intervalId) window.clearInterval(intervalId);
+    };
+  }, [safeSession?.replay_session_id, running]);
 
   // Toggle save status
   const handleToggleSave = async (replaySessionId: string) => {
@@ -1467,6 +1632,10 @@ function ReplayContentWithHydrationFix() {
                       {templates.map(t => (
                         <SelectItem key={t.id} value={t.id} className="text-slate-100 focus:bg-slate-700 cursor-pointer">{t.name}</SelectItem>
                       ))}
+                      <SelectSeparator className="bg-slate-700" />
+                      <SelectItem value="dynamic_selection" className="text-indigo-300 focus:bg-slate-700 cursor-pointer">
+                        🔄 动态选择（多策略组合）
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                   {STRATEGY_INTERVAL_MAP[selectedType] && (
@@ -1716,7 +1885,27 @@ function ReplayContentWithHydrationFix() {
             </Card>
 
             {/* Strategy Params Sliders */}
-            {currentTemplate && currentTemplate.params.length > 0 && (
+            {/* Dynamic Selection Strategy Panel */}
+            {selectedType === "dynamic_selection" && (
+              <AtomicStrategyPanel
+                strategies={atomicStrategies}
+                onChange={setAtomicStrategies}
+                templates={templates}
+                evaluationPeriod={evaluationPeriod}
+                onEvaluationPeriodChange={setEvaluationPeriod}
+                weightMethod={weightMethod}
+                onWeightMethodChange={setWeightMethod}
+                compositionThreshold={compositionThreshold}
+                onCompositionThresholdChange={setCompositionThreshold}
+                eliminationRule={eliminationRule}
+                onEliminationRuleChange={setEliminationRule}
+                perStrategyCapital={perStrategyCapital}
+                onPerStrategyCapitalChange={setPerStrategyCapital}
+                interval={interval}
+              />
+            )}
+            {/* Regular Strategy Params */}
+            {selectedType !== "dynamic_selection" && currentTemplate && currentTemplate.params.length > 0 && (
               <Card className="bg-slate-900 border-slate-700/50">
                 <CardHeader className="pb-3">
                   <CardTitle className="text-slate-100 text-sm flex items-center gap-2">
@@ -2142,7 +2331,23 @@ function ReplayContentWithHydrationFix() {
                     </div>
                   </div>
                 )}
-                
+
+                {/* Dynamic Selection 策略专用：淘汰历史 + 权重变化图表 */}
+                {safeSession?.strategy_type === "dynamic_selection" && safeSession?.replay_session_id && (
+                  <div className="space-y-4 mt-4">
+                    <EliminationHistory
+                      sessionId={safeSession.replay_session_id}
+                      isRunning={running}
+                      data={dynamicSelectionHistory}
+                    />
+                    <WeightEvolutionChart
+                      sessionId={safeSession.replay_session_id}
+                      isRunning={running}
+                      data={dynamicSelectionHistory}
+                    />
+                  </div>
+                )}
+
                 {/* Attribution Link */}
                 <div className="pt-4 flex justify-between items-center">
                   <Link href={`/analytics?mode=historical_replay&session_id=${session?.replay_session_id}`}>

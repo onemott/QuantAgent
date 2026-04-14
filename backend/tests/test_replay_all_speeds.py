@@ -7,6 +7,8 @@ import asyncio
 import time
 import logging
 from datetime import datetime, timedelta, timezone
+import pytest
+from unittest.mock import patch
 from app.core.bus import TradingBusImpl, ReplayConfig, TradingMode, PaperExecutionRouter
 from app.services.historical_replay_adapter import HistoricalReplayAdapter
 from app.models.trading import BarData
@@ -15,7 +17,7 @@ logging.basicConfig(level=logging.WARNING)  # 减少日志输出
 logger = logging.getLogger(__name__)
 
 
-async def test_speed(speed: int, bars_count: int = 60):
+async def run_speed_case(speed: int, bars_count: int = 60):
     """
     测试指定倍速是否正常工作
     使用mock数据，无需数据库和网络
@@ -67,7 +69,7 @@ async def test_speed(speed: int, bars_count: int = 60):
     # 计数收到的bar
     bars_received = 0
     
-    async def bar_callback(bar: BarData):
+    def bar_callback(bar: BarData):
         nonlocal bars_received
         bars_received += 1
     
@@ -77,8 +79,11 @@ async def test_speed(speed: int, bars_count: int = 60):
     
     start_real_time = time.time()
     
-    # 运行回放
-    await adapter.start_playback()
+    async def fast_sleep(_seconds):
+        return None
+
+    with patch("app.services.historical_replay_adapter.asyncio.sleep", new=fast_sleep):
+        await adapter.start_playback()
     
     elapsed_time = time.time() - start_real_time
     
@@ -102,6 +107,15 @@ async def test_speed(speed: int, bars_count: int = 60):
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("speed", [1, 10, 60, 100, 500, 1000, -1])
+async def test_replay_all_supported_speeds(speed: int):
+    result = await run_speed_case(speed, bars_count=5)
+
+    assert result["passed"]
+    assert result["bars_received"] == 5
+
+
 async def main():
     """测试所有倍速"""
     speeds_to_test = [1, 10, 60, 100, 500, 1000, -1]
@@ -111,7 +125,7 @@ async def main():
     print("=" * 60)
     
     for speed in speeds_to_test:
-        result = await test_speed(speed, bars_count=60)
+        result = await run_speed_case(speed, bars_count=60)
         status = "PASS" if result["passed"] else "FAIL"
         print(f"  {speed:>6}x: {status} | 收到 {result['bars_received']} 根K线 | 耗时 {result['elapsed_time']:.3f}s")
     

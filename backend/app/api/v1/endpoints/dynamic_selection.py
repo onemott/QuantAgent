@@ -379,6 +379,7 @@ async def _get_all_strategies_with_trades(
 @router.post("/evaluate")
 async def trigger_evaluation(
     request: EvaluateRequest,
+    session_id: Optional[str] = Query(None, description="回放会话ID，用于关联评估记录"),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -489,6 +490,7 @@ async def trigger_evaluation(
         # 7. 保存选择历史到 SelectionHistory 表
         # 使用统一的 evaluation_time，确保与 StrategyEvaluation 的 evaluation_date 一致
         history = SelectionHistory(
+            session_id=session_id,
             evaluation_date=evaluation_time,
             total_strategies=len(ranked_strategies),
             surviving_count=len(surviving),
@@ -533,12 +535,17 @@ async def trigger_evaluation(
 @router.get("/history")
 async def get_selection_history(
     limit: int = Query(10, ge=1, le=100),
+    session_id: Optional[str] = Query(None, description="按回放会话ID过滤"),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get the history of strategy selections and eliminations.
     """
-    stmt = select(SelectionHistory).order_by(desc(SelectionHistory.evaluation_date)).limit(limit)
+    stmt = select(SelectionHistory)
+    if session_id:
+        stmt = stmt.where(SelectionHistory.session_id == session_id)
+    stmt = stmt.order_by(desc(SelectionHistory.evaluation_date)).limit(limit)
+    
     result = await db.execute(stmt)
     history = result.scalars().all()
     

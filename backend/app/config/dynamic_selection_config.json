@@ -1,0 +1,13 @@
+{
+  "evaluation_period": "1m",
+  "elimination_threshold": 40,
+  "relative_ratio": 0.2,
+  "min_strategies": 2,
+  "max_strategies": 5,
+  "metrics_weights": {
+    "return_score": 0.4,
+    "risk_score": 0.2,
+    "stability_score": 0.2,
+    "efficiency_score": 0.2
+  }
+}

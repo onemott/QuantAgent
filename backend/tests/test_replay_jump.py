@@ -2,6 +2,8 @@
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
+import pytest
+from unittest.mock import patch
 from app.core.bus import TradingBusImpl, ReplayConfig, TradingMode, PaperExecutionRouter
 from app.services.historical_replay_adapter import HistoricalReplayAdapter
 from app.models.trading import BarData
@@ -10,6 +12,7 @@ from app.models.trading import BarData
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@pytest.mark.asyncio
 async def test_replay_jump_functionality():
     """
     Test Case: 
@@ -59,48 +62,52 @@ async def test_replay_jump_functionality():
     bus.data_adapter = adapter
     
     received_bars = []
-    async def on_bar(bar):
+    def on_bar(bar):
         received_bars.append(bar)
         # logger.info(f"Received bar: {bar.datetime}")
 
     bus.subscribe_bars(on_bar)
     
     # 1. Start playback in background
-    playback_task = asyncio.create_task(adapter.start_playback())
+    async def fast_sleep(seconds):
+        return None
+
+    with patch("app.services.historical_replay_adapter.asyncio.sleep", new=fast_sleep):
+        playback_task = asyncio.create_task(adapter.start_playback())
     
-    # 2. Wait until we reach 12:30
-    target_pause_time = datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc)
-    logger.info(f"Waiting for replay to reach {target_pause_time}...")
-    
-    while True:
-        if bus.current_simulated_time and bus.current_simulated_time >= target_pause_time:
-            break
-        await asyncio.sleep(0.1)
-    
-    # 3. Pause
-    bus.pause()
-    logger.info(f"Replay paused at {bus.current_simulated_time}")
-    
-    # Record how many bars received so far
-    bars_before_jump = len(received_bars)
-    last_bar_before_jump = received_bars[-1].datetime
-    logger.info(f"Bars received before jump: {bars_before_jump}, last bar: {last_bar_before_jump}")
-    
-    # 4. Jump to 18:00
-    target_jump_time = datetime(2026, 3, 15, 18, 0, tzinfo=timezone.utc)
-    logger.info(f"Jumping to {target_jump_time}...")
-    await bus.jump_to(target_jump_time)
-    
-    # 5. Resume
-    logger.info("Resuming replay...")
-    bus.resume()
-    
-    # 6. Wait for a few more bars
-    await asyncio.sleep(1) # At 100x speed, 1s real time = 100m sim time
-    
-    # 7. Stop
-    adapter.stop_playback()
-    await playback_task
+        # 2. Wait until we reach 12:30
+        target_pause_time = datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc)
+        logger.info(f"Waiting for replay to reach {target_pause_time}...")
+        
+        while True:
+            if bus.current_simulated_time and bus.current_simulated_time >= target_pause_time:
+                break
+            await asyncio.sleep(0)
+        
+        # 3. Pause
+        bus.pause()
+        logger.info(f"Replay paused at {bus.current_simulated_time}")
+        
+        # Record how many bars received so far
+        bars_before_jump = len(received_bars)
+        last_bar_before_jump = received_bars[-1].datetime
+        logger.info(f"Bars received before jump: {bars_before_jump}, last bar: {last_bar_before_jump}")
+        
+        # 4. Jump to 18:00
+        target_jump_time = datetime(2026, 3, 15, 18, 0, tzinfo=timezone.utc)
+        logger.info(f"Jumping to {target_jump_time}...")
+        await bus.jump_to(target_jump_time)
+        
+        # 5. Resume
+        logger.info("Resuming replay...")
+        bus.resume()
+        
+        # 6. Wait for a few more bars
+        await asyncio.sleep(0)
+        
+        # 7. Stop
+        adapter.stop_playback()
+        await playback_task
     
     # 8. Verification
     bars_after_jump = received_bars[bars_before_jump:]

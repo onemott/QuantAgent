@@ -63,8 +63,8 @@ class CompositionOptimizer:
         df = await self._fetch_historical_data(
             symbol, interval, data_limit, use_clickhouse
         )
-        if df is None or len(df) < 50:
-            raise ValueError("历史数据不足，无法进行优化")
+        if df is None or len(df) < 300:
+            raise ValueError(f"历史数据不足：当前 {len(df) if df is not None else 0} 根，至少需要 300 根")
         
         logger.info(f"获取到 {len(df)} 条历史数据")
         
@@ -569,8 +569,8 @@ class CompositionOptimizer:
         df = await self._fetch_historical_data(
             symbol, interval, data_limit, use_clickhouse=True
         )
-        if df is None or len(df) < 50:
-            raise ValueError("历史数据不足")
+        if df is None or len(df) < 300:
+            raise ValueError(f"历史数据不足：当前 {len(df) if df is not None else 0} 根，至少需要 300 根")
         
         # 获取原子策略信号
         atomic_signals = await self._run_atomic_strategies(df, atomic_strategies)

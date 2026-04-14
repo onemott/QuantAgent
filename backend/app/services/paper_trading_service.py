@@ -1209,7 +1209,7 @@ class PaperTradingService:
                     else:
                         price = avg
 
-                    position_value += abs(qty) * price
+                    position_value += qty * price
 
                 total_equity = cash_balance + position_value
 

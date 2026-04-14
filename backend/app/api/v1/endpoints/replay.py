@@ -361,6 +361,9 @@ def get_strategy_class(strategy_type: str):
     # MA strategy has its own dedicated implementation
     if strategy_type == "ma":
         return MaCrossStrategy
+    if strategy_type == "dynamic_selection":
+        from app.strategies.dynamic_selection_strategy import DynamicSelectionStrategy
+        return DynamicSelectionStrategy
     # Sync strategies use the generic signal-based adapter
     # Supported: rsi, boll, macd, ema_triple, atr_trend, turtle, ichimoku
     sync_types = {"rsi", "boll", "macd", "ema_triple", "atr_trend", "turtle", "ichimoku"}
@@ -380,8 +383,66 @@ async def create_replay_session(
     if request.strategy_type in async_strategies:
         raise HTTPException(
             status_code=400, 
-            detail=f"Strategy '{request.strategy_type}' requires real-time macro data and is not supported for historical replay. Please use: ma, rsi, boll, macd, ema_triple, atr_trend, turtle, or ichimoku."
+            detail=f"Strategy '{request.strategy_type}' requires real-time macro data and is not supported for historical replay. Please use: ma, rsi, boll, macd, ema_triple, atr_trend, turtle, ichimoku, or dynamic_selection."
         )
+    
+    if request.strategy_type == "dynamic_selection":
+        params = request.params or {}
+        atomic_strategies = params.get("atomic_strategies")
+        if not atomic_strategies or not isinstance(atomic_strategies, list):
+            raise HTTPException(
+                status_code=400,
+                detail="dynamic_selection strategy requires a non-empty list of 'atomic_strategies' in params."
+            )
+        
+        sync_types = {"ma", "rsi", "boll", "macd", "ema_triple", "atr_trend", "turtle", "ichimoku"}
+        for idx, item in enumerate(atomic_strategies):
+            if "strategy_id" not in item or "strategy_type" not in item:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Atomic strategy at index {idx} must contain 'strategy_id' and 'strategy_type'."
+                )
+            if item["strategy_type"] not in sync_types:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Atomic strategy type '{item['strategy_type']}' is not supported. Supported types: {sync_types}"
+                )
+        
+        # Validate evaluation_period: must be a positive integer
+        evaluation_period = params.get("evaluation_period")
+        if evaluation_period is not None:
+            if not isinstance(evaluation_period, int) or evaluation_period <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="evaluation_period must be a positive integer (> 0)"
+                )
+        
+        # Validate elimination_rule: must be a dict with valid field ranges
+        elimination_rule = params.get("elimination_rule")
+        if elimination_rule is not None:
+            if not isinstance(elimination_rule, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="elimination_rule must be a dictionary"
+                )
+            
+            # Validate min_score_threshold: must be in range 0-100
+            min_score = elimination_rule.get("min_score_threshold")
+            if min_score is not None:
+                if not isinstance(min_score, (int, float)) or min_score < 0 or min_score > 100:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="elimination_rule.min_score_threshold must be between 0 and 100"
+                    )
+            
+            # Validate elimination_ratio: must be in range 0-1
+            elim_ratio = elimination_rule.get("elimination_ratio")
+            if elim_ratio is not None:
+                if not isinstance(elim_ratio, (int, float)) or elim_ratio < 0 or elim_ratio > 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="elimination_rule.elimination_ratio must be between 0 and 1"
+                    )
     
     # 1. Validate interval
     valid_intervals = {"1m", "5m", "15m", "1h", "4h", "1d"}

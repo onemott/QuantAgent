@@ -11,6 +11,29 @@ class EliminationRule:
     low_score_threshold: float = 50.0  # 连续低分判断阈值
     min_strategies: int = 3            # 最少保留策略数
 
+    def __post_init__(self):
+        """Validate field ranges after initialization."""
+        if not (0 <= self.min_score_threshold <= 100):
+            raise ValueError(
+                f"min_score_threshold must be between 0 and 100, got {self.min_score_threshold}"
+            )
+        if not (0 <= self.elimination_ratio <= 1):
+            raise ValueError(
+                f"elimination_ratio must be between 0 and 1, got {self.elimination_ratio}"
+            )
+        if self.min_consecutive_low < 1:
+            raise ValueError(
+                f"min_consecutive_low must be >= 1, got {self.min_consecutive_low}"
+            )
+        if not (0 <= self.low_score_threshold <= 100):
+            raise ValueError(
+                f"low_score_threshold must be between 0 and 100, got {self.low_score_threshold}"
+            )
+        if self.min_strategies < 1:
+            raise ValueError(
+                f"min_strategies must be >= 1, got {self.min_strategies}"
+            )
+
 class StrategyEliminator:
     """策略淘汰器：执行末位淘汰机制"""
 
