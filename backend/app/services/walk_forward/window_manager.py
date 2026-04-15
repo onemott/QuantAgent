@@ -25,12 +25,38 @@ class WindowManager:
         """
         if method not in ['rolling', 'expanding']:
             raise ValueError("method must be 'rolling' or 'expanding'")
-            
+             
         self.method = method
-        self.train_size = train_size
-        self.test_size = test_size
-        self.step_size = step_size if step_size is not None else test_size
-        self.embargo_size = embargo_size
+        self.train_size = self._validate_size("train_size", train_size, allow_zero=False)
+        self.test_size = self._validate_size("test_size", test_size, allow_zero=False)
+        resolved_step_size = step_size if step_size is not None else test_size
+        self.step_size = self._validate_size("step_size", resolved_step_size, allow_zero=False)
+        self.embargo_size = self._validate_size("embargo_size", embargo_size, allow_zero=True)
+
+    @staticmethod
+    def _validate_size(
+        name: str,
+        value: Union[int, pd.Timedelta, timedelta],
+        *,
+        allow_zero: bool,
+    ) -> Union[int, pd.Timedelta, timedelta]:
+        """Validate window-size parameters early to avoid infinite loops during generation."""
+        if isinstance(value, int):
+            if value < 0 or (value == 0 and not allow_zero):
+                comparator = ">= 0" if allow_zero else "> 0"
+                raise ValueError(f"{name} must be {comparator}")
+            return value
+
+        if isinstance(value, (timedelta, pd.Timedelta)):
+            normalized_value = pd.Timedelta(value)
+            if normalized_value < pd.Timedelta(0) or (
+                normalized_value == pd.Timedelta(0) and not allow_zero
+            ):
+                comparator = ">= 0" if allow_zero else "> 0"
+                raise ValueError(f"{name} must be {comparator}")
+            return normalized_value
+
+        raise TypeError(f"{name} must be int or timedelta/pd.Timedelta")
 
     def generate_windows(self, data_index: pd.DatetimeIndex) -> List[Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]]:
         """

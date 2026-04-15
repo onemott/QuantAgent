@@ -6,11 +6,12 @@ Provides performance metrics, equity curve, trade pairs, and position analysis.
 import logging
 from contextlib import asynccontextmanager
 from fastapi import APIRouter, HTTPException, Query, Depends
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.services.attribution_service import attribution_service
+from app.services.metrics_calculator import MetricValueType, StandardizedMetricsSnapshot
 from app.services.performance_service import performance_service
 from app.services.trade_pair_service import trade_pair_service
 from app.services.position_analysis_service import position_analysis_service
@@ -162,7 +163,8 @@ async def get_strategy_attribution(
     days: int = Query(7, ge=1, le=30),
     base_mode: str = Query("backtest"),
     compare_mode: Optional[str] = Query(None),
-    replay_session_id: Optional[str] = Query(None)
+    replay_session_id: Optional[str] = Query(None),
+    alignment_window_seconds: int = Query(60, ge=1, le=2592000, description="成交对齐时间窗口，单位秒"),
 ):
     """Get detailed attribution analysis for a specific strategy."""
     import logging
@@ -188,6 +190,16 @@ async def get_strategy_attribution(
         },
         "signal_level_details": [],
         "trades": [],
+        "alignment_quality": {
+            "alignment_window_seconds": alignment_window_seconds,
+            "direct_match_count": 0,
+            "fuzzy_match_count": 0,
+            "matched_count": 0,
+            "unmatched_count": 0,
+            "match_rate": 0.0,
+            "avg_alignment_gap_seconds": None,
+            "median_alignment_gap_seconds": None,
+        },
     }
     
     try:
@@ -206,7 +218,8 @@ async def get_strategy_attribution(
             days=days,
             base_mode=base_mode,
             compare_mode=compare_mode,
-            replay_session_id=replay_session_id
+            replay_session_id=replay_session_id,
+            alignment_window_seconds=alignment_window_seconds,
         )
         
         # 处理服务层返回的错误
@@ -915,38 +928,249 @@ async def get_replay_backtest_comparison(
         ]
 
         # 定义 key 映射（replay key -> 可能的 backtest key 别名）
-        # 扩展的别名映射，确保各种字段名称都能匹配
+        # 每个别名都显式绑定预期单位，避免金额/比例字段被错误命中。
         KEY_ALIASES = {
-            "total_return": ["total_return", "total_return_pct", "return_pct", "total_pnl_pct"],
-            "annualized_return": ["annualized_return", "annualized_return_pct", "annual_return"],
-            "max_drawdown": ["max_drawdown", "max_dd", "maximum_drawdown", "max_drawdown_amount"],
-            "max_drawdown_pct": ["max_drawdown_pct", "max_dd_pct", "max_drawdown_percent"],
-            "max_drawdown_duration": ["max_drawdown_duration", "max_dd_duration", "max_drawdown_days"],
-            "sharpe_ratio": ["sharpe_ratio", "sharpe"],
-            "sortino_ratio": ["sortino_ratio", "sortino"],
-            "calmar_ratio": ["calmar_ratio", "calmar"],
-            "volatility": ["volatility", "vol", "annual_volatility"],
-            "win_rate": ["win_rate", "win_ratio", "winning_rate"],
-            "profit_factor": ["profit_factor", "profit_loss_ratio", "pnl_ratio"],
-            "total_trades": ["total_trades", "trade_count", "num_trades"],
-            "final_equity": ["final_equity", "ending_equity", "final_capital", "end_equity"],
-            "var_95": ["var_95", "value_at_risk", "var_95_pct"],
+            "total_return": [
+                {"key": "total_return", "unit": None},
+                {"key": "total_return_pct", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "return_pct", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "total_pnl_pct", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "canonical_metrics.total_return", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "annualized_return": [
+                {"key": "annualized_return", "unit": None},
+                {"key": "annualized_return_pct", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "annual_return", "unit": None},
+                {"key": "canonical_metrics.annualized_return", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "max_drawdown": [
+                {"key": "max_drawdown_amount", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "maximum_drawdown", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "max_dd", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "max_drawdown", "unit": MetricValueType.ABSOLUTE_VALUE.value, "require_explicit_type": True},
+                {"key": "canonical_metrics.max_drawdown", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+            ],
+            "max_drawdown_pct": [
+                {"key": "max_drawdown_pct", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "max_dd_pct", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "max_drawdown_percent", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "max_drawdown", "unit": MetricValueType.PERCENTAGE.value, "require_explicit_type": True},
+                {"key": "canonical_metrics.max_drawdown_pct", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "max_drawdown_duration": [
+                {"key": "max_drawdown_duration", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "max_dd_duration", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "max_drawdown_days", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+            ],
+            "sharpe_ratio": [
+                {"key": "sharpe_ratio", "unit": MetricValueType.DECIMAL.value},
+                {"key": "sharpe", "unit": MetricValueType.DECIMAL.value},
+                {"key": "canonical_metrics.sharpe_ratio", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "sortino_ratio": [
+                {"key": "sortino_ratio", "unit": MetricValueType.DECIMAL.value},
+                {"key": "sortino", "unit": MetricValueType.DECIMAL.value},
+                {"key": "canonical_metrics.sortino_ratio", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "calmar_ratio": [
+                {"key": "calmar_ratio", "unit": MetricValueType.DECIMAL.value},
+                {"key": "calmar", "unit": MetricValueType.DECIMAL.value},
+                {"key": "canonical_metrics.calmar_ratio", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "volatility": [
+                {"key": "volatility", "unit": None},
+                {"key": "vol", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "annual_volatility", "unit": None},
+                {"key": "canonical_metrics.volatility", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "win_rate": [
+                {"key": "win_rate", "unit": None},
+                {"key": "win_ratio", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "winning_rate", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "canonical_metrics.win_rate", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "profit_factor": [
+                {"key": "profit_factor", "unit": MetricValueType.DECIMAL.value},
+                {"key": "profit_loss_ratio", "unit": MetricValueType.DECIMAL.value},
+                {"key": "pnl_ratio", "unit": MetricValueType.DECIMAL.value},
+            ],
+            "total_trades": [
+                {"key": "total_trades", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "trade_count", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "num_trades", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "canonical_metrics.total_trades", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+            ],
+            "final_equity": [
+                {"key": "final_equity", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "ending_equity", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "final_capital", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "end_equity", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+                {"key": "canonical_metrics.final_capital", "unit": MetricValueType.ABSOLUTE_VALUE.value},
+            ],
+            "var_95": [
+                {"key": "var_95", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "value_at_risk", "unit": MetricValueType.PERCENTAGE.value},
+                {"key": "var_95_pct", "unit": MetricValueType.PERCENTAGE.value},
+            ],
         }
 
-        def get_metric_value(metrics_dict, metric_key):
-            """从metrics字典中获取值，支持别名查找"""
+        SNAPSHOT_ATTRS = {
+            "total_return": "total_return",
+            "annualized_return": "annualized_return",
+            "max_drawdown": "max_drawdown",
+            "max_drawdown_pct": "max_drawdown_pct",
+            "sharpe_ratio": "sharpe_ratio",
+            "sortino_ratio": "sortino_ratio",
+            "calmar_ratio": "calmar_ratio",
+            "volatility": "volatility",
+            "win_rate": "win_rate",
+            "total_trades": "total_trades",
+            "final_equity": "final_capital",
+        }
+
+        METRIC_UNIT_FAMILIES = {
+            "total_return": "ratio",
+            "annualized_return": "ratio",
+            "max_drawdown": MetricValueType.ABSOLUTE_VALUE.value,
+            "max_drawdown_pct": "ratio",
+            "max_drawdown_duration": MetricValueType.ABSOLUTE_VALUE.value,
+            "sharpe_ratio": MetricValueType.DECIMAL.value,
+            "sortino_ratio": MetricValueType.DECIMAL.value,
+            "calmar_ratio": MetricValueType.DECIMAL.value,
+            "volatility": "ratio",
+            "win_rate": "ratio",
+            "profit_factor": MetricValueType.DECIMAL.value,
+            "total_trades": MetricValueType.ABSOLUTE_VALUE.value,
+            "final_equity": MetricValueType.ABSOLUTE_VALUE.value,
+            "var_95": "ratio",
+        }
+
+        def _metric_family(metric_key: str) -> str:
+            return METRIC_UNIT_FAMILIES.get(metric_key, MetricValueType.DECIMAL.value)
+
+        def _read_nested_metric(metrics_dict: Dict[str, Any], key_path: str) -> Any:
+            current: Any = metrics_dict
+            for part in key_path.split('.'):
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(part)
+            return current
+
+        def _has_metric_value(metrics_dict: Dict[str, Any], metric_key: str) -> bool:
+            for alias_spec in KEY_ALIASES.get(metric_key, []):
+                if _read_nested_metric(metrics_dict, alias_spec["key"]) is not None:
+                    return True
+            return False
+
+        def _coerce_metric_type(metric_type: Optional[Any]) -> Optional[str]:
+            if metric_type is None:
+                return None
+            metric_type_name = str(metric_type)
+            if metric_type_name in {
+                MetricValueType.PERCENTAGE.value,
+                MetricValueType.DECIMAL.value,
+                MetricValueType.ABSOLUTE_VALUE.value,
+            }:
+                return metric_type_name
+            return None
+
+        def _default_unit_for_alias(metric_key: str, alias_spec: Dict[str, Any]) -> Optional[str]:
+            alias_unit = _coerce_metric_type(alias_spec.get("unit"))
+            if alias_unit is not None:
+                return alias_unit
+            family = _metric_family(metric_key)
+            if family == "ratio":
+                return MetricValueType.PERCENTAGE.value
+            return family
+
+        def _is_unit_compatible(metric_key: str, metric_type: Optional[str]) -> bool:
+            if metric_type is None:
+                return False
+            family = _metric_family(metric_key)
+            if family == "ratio":
+                return metric_type in {MetricValueType.PERCENTAGE.value, MetricValueType.DECIMAL.value}
+            return metric_type == family
+
+        def _normalize_metric_value(metric_key: str, raw_value: Any, metric_type: str) -> Optional[Tuple[float, float]]:
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                return None
+
+            family = _metric_family(metric_key)
+            if family == "ratio":
+                canonical_value = numeric_value / 100.0 if metric_type == MetricValueType.PERCENTAGE.value else numeric_value
+                display_value = canonical_value * 100.0
+                return canonical_value, display_value
+
+            if family == MetricValueType.ABSOLUTE_VALUE.value:
+                return numeric_value, numeric_value
+
+            return numeric_value, numeric_value
+
+        replay_snapshot = StandardizedMetricsSnapshot.from_source(replay_metrics) if replay_metrics else None
+
+        def get_metric_value(metrics_dict, metric_key, snapshot=None):
+            """从 metrics 字典中获取值，并先做单位标准化。"""
             if not metrics_dict:
                 return None
-            # 直接查找
-            val = metrics_dict.get(metric_key)
-            if val is not None:
-                return val
-            # 别名查找
+
+            snapshot_attr = SNAPSHOT_ATTRS.get(metric_key)
+            if (
+                snapshot is not None
+                and snapshot_attr is not None
+                and hasattr(snapshot, snapshot_attr)
+                and _has_metric_value(metrics_dict, metric_key)
+            ):
+                canonical_value = getattr(snapshot, snapshot_attr)
+                display_value = canonical_value * 100.0 if _metric_family(metric_key) == "ratio" else canonical_value
+                return {
+                    "value": display_value,
+                    "canonical_value": canonical_value,
+                    "metric_type": (
+                        MetricValueType.PERCENTAGE.value
+                        if _metric_family(metric_key) == "ratio"
+                        else _metric_family(metric_key)
+                    ),
+                    "source_key": f"canonical_metrics.{snapshot_attr}",
+                }
+
             aliases = KEY_ALIASES.get(metric_key, [])
-            for alias in aliases:
-                val = metrics_dict.get(alias)
-                if val is not None:
-                    return val
+            for alias_spec in aliases:
+                alias_key = alias_spec["key"]
+                raw_value = _read_nested_metric(metrics_dict, alias_key)
+                if raw_value is None:
+                    continue
+
+                explicit_type = None
+                if isinstance(metrics_dict, dict):
+                    metric_types = metrics_dict.get("metric_types")
+                    if isinstance(metric_types, dict):
+                        explicit_type = _coerce_metric_type(metric_types.get(alias_key.split(".")[-1]))
+
+                if alias_spec.get("require_explicit_type") and explicit_type is None:
+                    continue
+
+                resolved_type = explicit_type or _default_unit_for_alias(metric_key, alias_spec)
+                if not _is_unit_compatible(metric_key, resolved_type):
+                    logger.debug(
+                        "Skip analytics alias due to incompatible unit: metric=%s alias=%s unit=%s",
+                        metric_key,
+                        alias_key,
+                        resolved_type,
+                    )
+                    continue
+
+                normalized_pair = _normalize_metric_value(metric_key, raw_value, resolved_type)
+                if normalized_pair is None:
+                    continue
+                canonical_value, display_value = normalized_pair
+                return {
+                    "value": display_value,
+                    "canonical_value": canonical_value,
+                    "metric_type": resolved_type,
+                    "source_key": alias_key,
+                }
             return None
 
         def _enrich_backtest_metrics(bt_record, bt_metrics_dict):
@@ -985,30 +1209,45 @@ async def get_replay_backtest_comparison(
 
         # 使用 _enrich_backtest_metrics 补充缺失指标
         bt_metrics = _enrich_backtest_metrics(primary_bt, (primary_bt.metrics or {}) if primary_bt else {})
+        bt_snapshot = StandardizedMetricsSnapshot.from_source(bt_metrics) if bt_metrics else None
 
         comparisons = []
         for metric_key, metric_label, better_direction in METRICS_TO_COMPARE:
-            r_val = replay_metrics.get(metric_key)
-            
-            # 使用 get_metric_value 支持别名查找
-            b_val = get_metric_value(bt_metrics, metric_key) if primary_bt else None
+            r_metric = get_metric_value(replay_metrics, metric_key, replay_snapshot)
+            b_metric = get_metric_value(bt_metrics, metric_key, bt_snapshot) if primary_bt else None
+            r_val = r_metric["value"] if r_metric else None
+            b_val = b_metric["value"] if b_metric else None
 
             if primary_bt is None:
                 # 无回测记录，delta 为 null
                 delta = None
                 interpretation = "无回测数据可比"
-            elif r_val is not None and b_val is not None:
-                delta = float(r_val) - float(b_val)
-                if better_direction == "max2" and delta > 0:
-                    interpretation = "回放优于回测"
-                elif better_direction == "max2" and delta < 0:
-                    interpretation = "回放劣于回测"
-                elif better_direction == "min2" and delta < 0:
-                    interpretation = "回放优于回测"
-                elif better_direction == "min2" and delta > 0:
-                    interpretation = "回放劣于回测"
+            elif r_metric is not None and b_metric is not None:
+                r_type = r_metric.get("metric_type")
+                b_type = b_metric.get("metric_type")
+                if not _is_unit_compatible(metric_key, r_type) or not _is_unit_compatible(metric_key, b_type):
+                    logger.warning(
+                        "Analytics comparison unit mismatch for %s: replay=%s(%s) backtest=%s(%s)",
+                        metric_key,
+                        r_metric.get("source_key"),
+                        r_type,
+                        b_metric.get("source_key"),
+                        b_type,
+                    )
+                    delta = None
+                    interpretation = "数据单位不一致"
                 else:
-                    interpretation = "基本持平"
+                    delta = float(r_metric["value"]) - float(b_metric["value"])
+                    if better_direction == "max2" and delta > 0:
+                        interpretation = "回放优于回测"
+                    elif better_direction == "max2" and delta < 0:
+                        interpretation = "回放劣于回测"
+                    elif better_direction == "min2" and delta < 0:
+                        interpretation = "回放优于回测"
+                    elif better_direction == "min2" and delta > 0:
+                        interpretation = "回放劣于回测"
+                    else:
+                        interpretation = "基本持平"
             else:
                 delta = None
                 interpretation = "数据不可比"
@@ -1299,6 +1538,7 @@ async def get_attribution_comparison(
     session_id: Optional[str] = Query(None, description="Replay session ID (required for historical_replay mode)"),
     symbol: Optional[str] = Query(None, description="Filter by symbol (e.g., BTCUSDT)"),
     days: int = Query(7, ge=1, le=90, description="Time range in days"),
+    alignment_window_seconds: int = Query(60, ge=1, le=2592000, description="成交对齐时间窗口，单位秒"),
 ):
     """
     获取两个模式下的归因数据对比。
@@ -1328,6 +1568,16 @@ async def get_attribution_comparison(
         "daily_breakdown": [],
         "symbol_breakdown": [],
         "trade_count": 0,
+        "alignment_quality": {
+            "alignment_window_seconds": alignment_window_seconds,
+            "direct_match_count": 0,
+            "fuzzy_match_count": 0,
+            "matched_count": 0,
+            "unmatched_count": 0,
+            "match_rate": 0.0,
+            "avg_alignment_gap_seconds": None,
+            "median_alignment_gap_seconds": None,
+        },
     }
     
     # Validate inputs
@@ -1347,6 +1597,7 @@ async def get_attribution_comparison(
             session_id=session_id,
             symbol=symbol,
             days=days,
+            alignment_window_seconds=alignment_window_seconds,
         )
         
         # 处理服务层返回的错误
@@ -1377,6 +1628,7 @@ async def get_enhanced_attribution(
     session_id: Optional[str] = Query(None, description="Session ID for historical_replay mode"),
     symbol: Optional[str] = Query("BTCUSDT"),
     days: int = Query(7, ge=1, le=30),
+    alignment_window_seconds: int = Query(60, ge=1, le=2592000, description="成交对齐时间窗口，单位秒"),
 ):
     """
     获取增强版归因分析，包含新增维度：
@@ -1410,6 +1662,16 @@ async def get_enhanced_attribution(
         },
         "trades": [],
         "full_attribution": None,
+        "alignment_quality": {
+            "alignment_window_seconds": alignment_window_seconds,
+            "direct_match_count": 0,
+            "fuzzy_match_count": 0,
+            "matched_count": 0,
+            "unmatched_count": 0,
+            "match_rate": 0.0,
+            "avg_alignment_gap_seconds": None,
+            "median_alignment_gap_seconds": None,
+        },
     }
     
     try:
@@ -1429,6 +1691,7 @@ async def get_enhanced_attribution(
             base_mode="backtest",
             compare_mode=mode,
             replay_session_id=session_id,
+            alignment_window_seconds=alignment_window_seconds,
         )
         
         # 处理服务层返回的错误
@@ -1479,6 +1742,7 @@ async def get_enhanced_attribution(
             "enhanced_summary": enhanced_summary,
             "trades": trades,
             "full_attribution": report,
+            "alignment_quality": report.get("alignment_quality", empty_response["alignment_quality"]),
         }
     except HTTPException:
         raise

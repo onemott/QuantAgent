@@ -9,6 +9,9 @@ from app.models.db_models import PaperTrade, BacktestResult, EquitySnapshot, Rep
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ALIGNMENT_WINDOW_SECONDS = 60
+ATTRIBUTION_RECONCILIATION_TOLERANCE = 1e-6
+
 # Strategy mapping for attribution lookup
 STRATEGY_MAP = {
     "auto_trend_ma": "ma",
@@ -21,6 +24,147 @@ class AttributionService:
     QAD (Quant Attribution & Dissection) 差异归因框架实现。
     基于订单级对齐实现回测与模拟盘的收益差异分解。
     """
+
+    @staticmethod
+    def _normalize_direction(
+        direction: Optional[Any] = None,
+        side: Optional[Any] = None,
+    ) -> int:
+        """标准化方向字段，买入/做多为 1，卖出/做空为 -1。"""
+        if direction is not None:
+            try:
+                direction_value = float(direction)
+                if direction_value > 0:
+                    return 1
+                if direction_value < 0:
+                    return -1
+            except (TypeError, ValueError):
+                pass
+
+        if side is None:
+            return 1
+
+        side_normalized = str(side).strip().upper()
+        if side_normalized in {"SELL", "SHORT", "-1"}:
+            return -1
+        return 1
+
+    @staticmethod
+    def _resolve_reference_price(row: pd.Series) -> float:
+        """优先使用触发价，其次使用回测价/模拟价，确保波动率和延迟计算有稳定基准。"""
+        for field in ("trigger_price", "bt_price", "sim_price"):
+            try:
+                value = float(row.get(field, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return 0.0
+
+    def _calc_signed_slippage_price(
+        self,
+        exec_price: float,
+        ideal_price: float,
+        direction: int,
+    ) -> float:
+        """
+        计算方向敏感的滑点价格差。
+
+        返回值为“对策略不利的价格差”：
+        - 买入：实际成交价高于理想价为正
+        - 卖出：实际成交价低于理想价为正
+        """
+        if ideal_price <= 0:
+            return 0.0
+        if direction < 0:
+            return ideal_price - exec_price
+        return exec_price - ideal_price
+
+    def _calc_slippage_impact(
+        self,
+        exec_price: float,
+        ideal_price: float,
+        quantity: float,
+        direction: int,
+    ) -> float:
+        """将方向敏感的滑点价格差换算为金额影响。正值表示更差的执行成本。"""
+        return self._calc_signed_slippage_price(exec_price, ideal_price, direction) * max(quantity, 0.0)
+
+    def _estimate_market_volatility(
+        self,
+        row: pd.Series,
+        df_mkt: Optional[pd.DataFrame] = None,
+    ) -> float:
+        """
+        估计成交窗口内的相对波动率。
+
+        优先使用外部市场数据；若不可用，则退化为触发价、回测成交价、模拟成交价
+        三个锚点的价格离散度。
+        """
+        reference_price = self._resolve_reference_price(row)
+        if reference_price <= 0:
+            return 0.0
+
+        if df_mkt is not None and not df_mkt.empty:
+            timestamp_col = next(
+                (col for col in ("timestamp", "ts", "datetime", "created_at") if col in df_mkt.columns),
+                None,
+            )
+            price_col = next(
+                (col for col in ("close", "price", "mid_price", "last_price") if col in df_mkt.columns),
+                None,
+            )
+            if timestamp_col and price_col:
+                signal_ts = pd.to_datetime(row.get("timestamp"), errors="coerce")
+                exec_ts = pd.to_datetime(row.get("sim_exec_ts"), errors="coerce")
+                market_window = df_mkt.copy()
+                if "symbol" in market_window.columns and row.get("symbol") is not None:
+                    market_window = market_window[market_window["symbol"] == row.get("symbol")]
+                market_window = market_window.copy()
+                market_window[timestamp_col] = pd.to_datetime(market_window[timestamp_col], errors="coerce")
+                if pd.notna(signal_ts) and pd.notna(exec_ts):
+                    window_start = min(signal_ts, exec_ts)
+                    window_end = max(signal_ts, exec_ts)
+                    market_window = market_window[
+                        (market_window[timestamp_col] >= window_start)
+                        & (market_window[timestamp_col] <= window_end)
+                    ]
+                if len(market_window) >= 2:
+                    price_series = pd.to_numeric(market_window[price_col], errors="coerce").dropna()
+                    if len(price_series) >= 2:
+                        returns = price_series.pct_change().dropna()
+                        if not returns.empty:
+                            return max(float(returns.std(ddof=0)), 0.0)
+
+        anchor_prices = []
+        for field in ("trigger_price", "bt_price", "sim_price"):
+            try:
+                value = float(row.get(field, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                anchor_prices.append(value)
+
+        if len(anchor_prices) < 2:
+            return 0.0
+        return max(float(np.std(anchor_prices, ddof=0) / reference_price), 0.0)
+
+    @staticmethod
+    def _calc_latency_impact(
+        timing_diff: float,
+        market_volatility: float,
+        reference_price: float,
+        quantity: float,
+    ) -> float:
+        """
+        根据延迟时间和相对波动率估算延迟成本。
+
+        这里返回的是非负成本估计值，不复用滑点绝对值，避免两个维度完全重合。
+        """
+        if timing_diff <= 0 or market_volatility <= 0 or reference_price <= 0 or quantity <= 0:
+            return 0.0
+        scaled_latency = min(float(timing_diff), 24 * 60 * 60)
+        return float(scaled_latency * market_volatility * reference_price * quantity)
 
     def aggregate_executions(self, df_exec: pd.DataFrame, prefix: str) -> pd.DataFrame:
         """
@@ -77,6 +221,14 @@ class AttributionService:
               slippage_impact, latency_impact, execution_quality, timing_diff
         """
         df = df_combined.copy()
+
+        if "direction" not in df.columns:
+            df["direction"] = 1
+        df["direction"] = df.apply(
+            lambda row: self._normalize_direction(row.get("direction"), row.get("side")),
+            axis=1,
+        )
+        df["reference_price"] = df.apply(self._resolve_reference_price, axis=1)
         
         # 3.1 共同成交量与数量差
         df['q_common'] = df[['bt_qty', 'sim_qty']].min(axis=1)
@@ -101,10 +253,16 @@ class AttributionService:
         df['delta_fees'] = df['bt_fee'] - df['sim_fee']
         
         # 3.6 新增归因维度 - Slippage Impact
-        # slippage_impact = (实际成交价 - 理想价格/触发价) * 成交量 * direction
-        # 对于买入：正值表示多花钱（不利滑点），负值表示省钱
-        # 对于卖出：direction=-1，正值表示少收钱（不利滑点）
-        df['slippage_impact'] = (df['sim_price'] - df['trigger_price']) * df['sim_qty'] * df['direction']
+        # 使用方向敏感的滑点：买入高于理想价、卖出低于理想价都视为正的负面影响。
+        df['slippage_impact'] = df.apply(
+            lambda row: self._calc_slippage_impact(
+                float(row.get('sim_price', 0.0) or 0.0),
+                float(row.get('trigger_price', row.get('bt_price', 0.0)) or 0.0),
+                float(row.get('sim_qty', 0.0) or 0.0),
+                int(row.get('direction', 1) or 1),
+            ),
+            axis=1
+        )
         
         # 3.7 新增归因维度 - Timing Diff (信号产生到成交的时间差，秒)
         df['timing_diff'] = 0.0
@@ -115,26 +273,46 @@ class AttributionService:
             )
         
         # 3.8 新增归因维度 - Latency Impact
-        # 延迟导致的价格变化影响 = timing_diff * 预估每秒价格变化率 * qty * direction
-        # 简化计算：使用 slippage 作为延迟影响的代理指标
-        # latency_impact ≈ abs(slippage_impact) 如果 timing_diff > 0
+        # 延迟成本 = 延迟秒数 × 相对波动率 × 基准价格 × 成交量
+        df['market_volatility'] = df.apply(
+            lambda row: self._estimate_market_volatility(row, df_mkt),
+            axis=1
+        )
         df['latency_impact'] = df.apply(
-            lambda row: abs(row['slippage_impact']) if row['timing_diff'] > 0 else 0.0,
+            lambda row: self._calc_latency_impact(
+                float(row.get('timing_diff', 0.0) or 0.0),
+                float(row.get('market_volatility', 0.0) or 0.0),
+                float(row.get('reference_price', 0.0) or 0.0),
+                float(row.get('sim_qty', 0.0) or 0.0),
+            ),
             axis=1
         )
         
         # 3.9 新增归因维度 - Execution Quality (0-100分)
-        # 基于滑点和延迟综合评估
-        # 评分标准：滑点百分比 < 0.1% 得100分，每增加0.1%减10分，最低0分
+        # 基于方向敏感滑点和成交延迟综合评估
         df['execution_quality'] = df.apply(
             lambda row: self._calc_execution_quality(
-                row['sim_price'], row['trigger_price'], row['timing_diff']
+                float(row.get('sim_price', 0.0) or 0.0),
+                float(row.get('trigger_price', row.get('bt_price', 0.0)) or 0.0),
+                float(row.get('timing_diff', 0.0) or 0.0),
+                int(row.get('direction', 1) or 1),
+                float(row.get('market_volatility', 0.0) or 0.0),
             ),
             axis=1
         )
         
         # 3.10 总差异校验
+        df['bt_pnl'] = (
+            (df['bt_price'] - df['trigger_price']) * df['bt_qty'] * df['direction']
+            - df['bt_fee']
+        )
+        df['sim_pnl'] = (
+            (df['sim_price'] - df['trigger_price']) * df['sim_qty'] * df['direction']
+            - df['sim_fee']
+        )
+        df['pnl_diff'] = df['sim_pnl'] - df['bt_pnl']
         df['delta_total'] = df['delta_price'] + df['delta_fill'] + df['delta_timing'] + df['delta_fees']
+        df['reconciliation_gap'] = df['pnl_diff'] - df['delta_total']
         
         return df
     
@@ -153,29 +331,132 @@ class AttributionService:
             return 0.0
     
     def _calc_execution_quality(
-        self, exec_price: float, ideal_price: float, timing_diff: float
+        self,
+        exec_price: float,
+        ideal_price: float,
+        timing_diff: float,
+        direction: int,
+        market_volatility: float = 0.0,
     ) -> float:
         """计算执行质量评分 (0-100)
         
         评分维度：
-        1. 滑点百分比：< 0.1% 得100分，每增加0.1%减10分
+        1. 方向敏感滑点百分比：< 0.1% 得100分，每增加0.1%减10分
         2. 延迟惩罚：每延迟1秒减1分
         """
         if ideal_price <= 0:
             return 50.0  # 缺少基准价时返回中间分数
         
-        # 滑点百分比（绝对值）
-        slippage_pct = abs(exec_price - ideal_price) / ideal_price * 100
+        adverse_slippage = max(
+            0.0,
+            self._calc_signed_slippage_price(exec_price, ideal_price, direction),
+        )
+        slippage_pct = adverse_slippage / ideal_price * 100
         
         # 滑点评分（滑点百分比每0.1%减10分）
         slippage_score = max(0, 100 - (slippage_pct / 0.1) * 10)
         
-        # 延迟惩罚（每秒减1分）
-        latency_penalty = min(timing_diff, 20)  # 最多扣20分
+        # 延迟惩罚（高波动时延迟更值得警惕，但仍限制总扣分）
+        latency_penalty = min(timing_diff * max(1.0, 1.0 + market_volatility * 10.0), 20)
         
         # 综合评分
         final_score = max(0, slippage_score - latency_penalty)
         return round(final_score, 1)
+
+    def _aggregate_dimension_breakdown(
+        self,
+        df_attribution: pd.DataFrame,
+        group_key: str,
+    ) -> pd.DataFrame:
+        """按日期或品种聚合归因结果，并保留新增维度统计。"""
+        diff_cols = ['delta_price', 'delta_fill', 'delta_timing', 'delta_fees', 'delta_total']
+        sum_cols = diff_cols + ['slippage_impact', 'latency_impact', 'bt_pnl', 'sim_pnl']
+        avg_cols = ['timing_diff', 'execution_quality', 'market_volatility', 'reconciliation_gap']
+
+        available_sum_cols = [col for col in sum_cols if col in df_attribution.columns]
+        available_avg_cols = [col for col in avg_cols if col in df_attribution.columns]
+
+        grouped = df_attribution.groupby(group_key, dropna=False)
+        summary = grouped[available_sum_cols].sum().reset_index() if available_sum_cols else grouped.size().reset_index()
+        summary['trade_count'] = grouped.size().values
+
+        if available_avg_cols:
+            averages = grouped[available_avg_cols].mean().reset_index()
+            rename_map = {
+                'timing_diff': 'avg_timing_diff',
+                'execution_quality': 'avg_execution_quality',
+                'market_volatility': 'avg_market_volatility',
+                'reconciliation_gap': 'avg_reconciliation_gap',
+            }
+            averages = averages.rename(columns=rename_map)
+            summary = summary.merge(averages, on=group_key, how='left')
+
+        return summary
+
+    def _validate_attribution_balance(
+        self,
+        df_attribution: pd.DataFrame,
+        global_agg: Dict[str, Any],
+        tolerance: float = ATTRIBUTION_RECONCILIATION_TOLERANCE,
+    ) -> None:
+        """
+        校验归因因子之和是否等于总 PnL 差异。
+
+        若存在误差，记录聚合级与样本级排查信息，便于后续定位。
+        """
+        factor_sum = float(
+            global_agg.get('delta_price', 0.0)
+            + global_agg.get('delta_fill', 0.0)
+            + global_agg.get('delta_timing', 0.0)
+            + global_agg.get('delta_fees', 0.0)
+        )
+        pnl_diff = float(global_agg.get('sim_total_pnl', 0.0) - global_agg.get('bt_total_pnl', 0.0))
+        gap = pnl_diff - factor_sum
+
+        global_agg['attribution_factor_sum'] = factor_sum
+        global_agg['pnl_diff'] = pnl_diff
+        global_agg['reconciliation_gap'] = gap
+        global_agg['reconciliation_ok'] = abs(gap) <= tolerance
+
+        if abs(gap) <= tolerance:
+            return
+
+        diagnostics: List[Dict[str, Any]] = []
+        if 'reconciliation_gap' in df_attribution.columns:
+            mismatch_rows = df_attribution[
+                df_attribution['reconciliation_gap'].abs() > tolerance
+            ]
+            if not mismatch_rows.empty:
+                diagnostic_columns = [
+                    col
+                    for col in (
+                        'signal_id',
+                        'symbol',
+                        'bt_qty',
+                        'sim_qty',
+                        'trigger_price',
+                        'bt_price',
+                        'sim_price',
+                        'delta_price',
+                        'delta_fill',
+                        'delta_timing',
+                        'delta_fees',
+                        'delta_total',
+                        'bt_pnl',
+                        'sim_pnl',
+                        'reconciliation_gap',
+                    )
+                    if col in mismatch_rows.columns
+                ]
+                diagnostics = mismatch_rows[diagnostic_columns].head(10).to_dict(orient='records')
+
+        logger.warning(
+            "Attribution reconciliation mismatch: factor_sum=%.8f pnl_diff=%.8f gap=%.8f diagnostics=%s",
+            factor_sum,
+            pnl_diff,
+            gap,
+            diagnostics,
+        )
 
     def aggregate_results(self, df_attribution: pd.DataFrame) -> Dict[str, Any]:
         """
@@ -196,6 +477,11 @@ class AttributionService:
                     "total_latency_impact": 0.0,
                     "avg_execution_quality": None,
                     "avg_timing_diff": None,
+                    "avg_market_volatility": None,
+                    "attribution_factor_sum": 0.0,
+                    "pnl_diff": 0.0,
+                    "reconciliation_gap": 0.0,
+                    "reconciliation_ok": True,
                 }
             }
             
@@ -205,15 +491,13 @@ class AttributionService:
         
         # 原有差异列
         diff_cols = ['delta_price', 'delta_fill', 'delta_timing', 'delta_fees', 'delta_total']
-        # 新增归因维度列
-        new_cols = ['slippage_impact', 'latency_impact', 'timing_diff', 'execution_quality']
         
         # 按日聚合
-        daily_agg = df_attribution.groupby('date')[diff_cols].sum().reset_index()
+        daily_agg = self._aggregate_dimension_breakdown(df_attribution, 'date')
         daily_agg['date'] = daily_agg['date'].astype(str)
         
         # 按品种聚合
-        symbol_agg = df_attribution.groupby('symbol')[diff_cols].sum().reset_index()
+        symbol_agg = self._aggregate_dimension_breakdown(df_attribution, 'symbol')
         
         # 全局聚合
         global_agg = df_attribution[diff_cols].sum().to_dict()
@@ -245,18 +529,20 @@ class AttributionService:
             global_agg['avg_timing_diff'] = round(float(avg_td), 2) if not pd.isna(avg_td) else None
         else:
             global_agg['avg_timing_diff'] = None
+
+        if 'market_volatility' in df_attribution.columns:
+            avg_mv = df_attribution['market_volatility'].mean()
+            global_agg['avg_market_volatility'] = round(float(avg_mv), 8) if not pd.isna(avg_mv) else None
+        else:
+            global_agg['avg_market_volatility'] = None
         
         # 计算回测与模拟盘总收益（供瀑布图使用）
-        # 回测总收益 = sum((bt_price - trigger_price) * bt_qty * direction - bt_fee)
-        bt_pnl = ((df_attribution['bt_price'] - df_attribution['trigger_price']) * 
-                  df_attribution['bt_qty'] * df_attribution['direction'] - 
-                  df_attribution['bt_fee']).sum()
-        
-        # 模拟盘总收益 = 回测收益 + 总差异
-        sim_pnl = bt_pnl + global_agg.get('delta_total', 0.0)
+        bt_pnl = float(df_attribution['bt_pnl'].sum()) if 'bt_pnl' in df_attribution.columns else 0.0
+        sim_pnl = float(df_attribution['sim_pnl'].sum()) if 'sim_pnl' in df_attribution.columns else (bt_pnl + global_agg.get('delta_total', 0.0))
         
         global_agg['bt_total_pnl'] = bt_pnl
         global_agg['sim_total_pnl'] = sim_pnl
+        self._validate_attribution_balance(df_attribution, global_agg)
         
         return {
             "daily_agg": daily_agg.to_dict(orient='records'),
@@ -286,6 +572,20 @@ class AttributionService:
             return obj.isoformat()
         return obj
 
+    @staticmethod
+    def _default_alignment_quality(alignment_window_seconds: int) -> Dict[str, Any]:
+        """默认对齐质量指标，确保空结果和异常结果结构稳定。"""
+        return {
+            "alignment_window_seconds": int(alignment_window_seconds),
+            "direct_match_count": 0,
+            "fuzzy_match_count": 0,
+            "matched_count": 0,
+            "unmatched_count": 0,
+            "match_rate": 0.0,
+            "avg_alignment_gap_seconds": None,
+            "median_alignment_gap_seconds": None,
+        }
+
     async def get_strategy_attribution(
         self,
         strategy_id: str,
@@ -293,7 +593,8 @@ class AttributionService:
         days: int = 7,
         base_mode: str = "backtest",
         compare_mode: Optional[str] = None,
-        replay_session_id: Optional[str] = None
+        replay_session_id: Optional[str] = None,
+        alignment_window_seconds: int = DEFAULT_ALIGNMENT_WINDOW_SECONDS,
     ) -> Dict[str, Any]:
         """
         获取策略的归因分析。
@@ -311,17 +612,28 @@ class AttributionService:
                 "delta_price": 0, "delta_fill": 0, "delta_timing": 0, "delta_fees": 0, "delta_total": 0,
                 "total_slippage_impact": 0, "total_latency_impact": 0,
                 "avg_execution_quality": None, "avg_timing_diff": None,
+                "avg_market_volatility": None,
+                "attribution_factor_sum": 0.0,
+                "pnl_diff": 0.0,
+                "reconciliation_gap": 0.0,
+                "reconciliation_ok": True,
             },
             "global_agg": {
                 "bt_total_pnl": 0, "sim_total_pnl": 0,
                 "delta_price": 0, "delta_fill": 0, "delta_timing": 0, "delta_fees": 0, "delta_total": 0,
                 "total_slippage_impact": 0, "total_latency_impact": 0,
                 "avg_execution_quality": None, "avg_timing_diff": None,
+                "avg_market_volatility": None,
+                "attribution_factor_sum": 0.0,
+                "pnl_diff": 0.0,
+                "reconciliation_gap": 0.0,
+                "reconciliation_ok": True,
             },
             "daily_agg": [],
             "symbol_agg": [],
             "signal_level_details": [],
             "trades": [],
+            "alignment_quality": self._default_alignment_quality(alignment_window_seconds),
         }
 
         try:
@@ -405,6 +717,8 @@ class AttributionService:
                         entry_price = float(bt_t.get('entry_price', 0) or 0)
                         quantity = float(bt_t.get('quantity', 0) or 0)
                         fee = float(bt_t.get('fee', 0) or 0)
+                        side = bt_t.get('side') or ('SELL' if float(bt_t.get('direction', 1) or 1) < 0 else 'BUY')
+                        direction = self._normalize_direction(bt_t.get('direction'), side)
                         
                         # 回测成交数据
                         bt_exec_data.append({
@@ -421,7 +735,8 @@ class AttributionService:
                             'signal_id': sig_id,
                             'timestamp': pd.to_datetime(bt_t.get('entry_time')),
                             'symbol': bt_t.get('symbol', symbol or "UNKNOWN"),
-                            'direction': 1, # 假设是买入，实际需根据 backtest 逻辑对齐
+                            'side': side,
+                            'direction': direction,
                             'target_qty': quantity,
                             'trigger_price': entry_price
                         })
@@ -437,31 +752,65 @@ class AttributionService:
                 
                 df_bt_exec = pd.DataFrame(bt_exec_data)
                 df_signals = pd.DataFrame(signal_data)
+                alignment_quality = self._default_alignment_quality(alignment_window_seconds)
                 
                 # 3. 对齐模拟盘数据与回测信号
                 # 如果 client_order_id 不匹配，使用基于时间和品种的模糊对齐
                 if not df_sim_exec.empty:
+                    if alignment_window_seconds <= 0:
+                        raise ValueError("alignment_window_seconds must be positive")
+
                     # 尝试通过 signal_id (client_order_id) 直接对齐
                     # 如果没对齐上，尝试模糊对齐
-                    unaligned_sim = df_sim_exec[~df_sim_exec['signal_id'].isin(df_signals['signal_id'])]
+                    direct_match_mask = df_sim_exec['signal_id'].isin(df_signals['signal_id'])
+                    alignment_quality['direct_match_count'] = int(direct_match_mask.sum())
+                    unaligned_sim = df_sim_exec[~direct_match_mask]
+                    fuzzy_match_count = 0
                     
                     if not unaligned_sim.empty:
-                        # 简单模糊对齐：在1分钟时间窗口内寻找最近的信号
+                        # 可配置时间窗口的模糊对齐，优先选择时间最接近的信号
                         for idx, sim_row in unaligned_sim.iterrows():
                             try:
                                 sim_ts = pd.to_datetime(sim_row['exec_ts'])
                                 # 寻找相同品种、时间相差在60秒以内的信号
                                 potential_matches = df_signals[
                                     (df_signals['symbol'] == sim_row['symbol']) & 
-                                    (abs(df_signals['timestamp'] - sim_ts) < timedelta(seconds=60))
+                                    ((df_signals['timestamp'] - sim_ts).abs() <= timedelta(seconds=alignment_window_seconds))
                                 ]
                                 if not potential_matches.empty:
-                                    # 匹配最近的一个
-                                    best_match_id = potential_matches.iloc[0]['signal_id']
+                                    best_match_idx = (potential_matches['timestamp'] - sim_ts).abs().idxmin()
+                                    best_match_id = potential_matches.loc[best_match_idx, 'signal_id']
                                     df_sim_exec.at[idx, 'signal_id'] = best_match_id
+                                    fuzzy_match_count += 1
                             except Exception as e:
                                 logger.debug(f"Failed to align sim trade {idx}: {e}")
                                 continue
+
+                    aligned_details = df_sim_exec.merge(
+                        df_signals[['signal_id', 'timestamp']],
+                        on='signal_id',
+                        how='left',
+                    )
+                    aligned_details['alignment_gap_seconds'] = aligned_details.apply(
+                        lambda row: abs(
+                            (pd.to_datetime(row['exec_ts']) - pd.to_datetime(row['timestamp'])).total_seconds()
+                        )
+                        if pd.notna(row.get('timestamp')) and pd.notna(row.get('exec_ts'))
+                        else np.nan,
+                        axis=1,
+                    )
+                    matched_mask = aligned_details['timestamp'].notna()
+                    gap_series = aligned_details.loc[matched_mask, 'alignment_gap_seconds'].dropna()
+                    alignment_quality.update({
+                        "fuzzy_match_count": int(fuzzy_match_count),
+                        "matched_count": int(matched_mask.sum()),
+                        "unmatched_count": int((~matched_mask).sum()),
+                        "match_rate": round(float(matched_mask.mean()), 4) if len(aligned_details) else 0.0,
+                        "avg_alignment_gap_seconds": round(float(gap_series.mean()), 4) if not gap_series.empty else None,
+                        "median_alignment_gap_seconds": round(float(gap_series.median()), 4) if not gap_series.empty else None,
+                    })
+                else:
+                    alignment_quality = self._default_alignment_quality(alignment_window_seconds)
 
                 # 4. 运行 QAD 计算逻辑
                 df_bt_agg = self.aggregate_executions(df_bt_exec, 'bt')
@@ -470,6 +819,7 @@ class AttributionService:
                 df_combined = self.merge_data(df_signals, df_bt_agg, df_sim_agg)
                 df_attribution = self.calculate_attribution(df_combined)
                 results = self.aggregate_results(df_attribution)
+                results['alignment_quality'] = alignment_quality
             
             # 将微观归因结果转为列表，供前端表格展示
             trades_list = df_attribution.to_dict(orient='records')
@@ -480,6 +830,7 @@ class AttributionService:
             
             results['signal_level_details'] = trades_list
             results['trades'] = trades_list # Alias for frontend compatibility
+            results.setdefault('alignment_quality', alignment_quality)
             
             # Ensure all types are standard Python types for JSON serialization
             return self._to_python_types(results)
@@ -498,6 +849,7 @@ class AttributionService:
         session_id: Optional[str] = None,
         symbol: Optional[str] = None,
         days: int = 7,
+        alignment_window_seconds: int = DEFAULT_ALIGNMENT_WINDOW_SECONDS,
     ) -> Dict[str, Any]:
         """
         获取两个模式（backtest vs historical_replay/paper）的归因数据对比。
@@ -521,6 +873,7 @@ class AttributionService:
             base_mode="backtest",
             compare_mode=compare_mode,
             replay_session_id=session_id,
+            alignment_window_seconds=alignment_window_seconds,
         )
         
         # 如果有错误，返回错误信息
@@ -599,6 +952,10 @@ class AttributionService:
             "daily_breakdown": compare_attribution.get("daily", []),
             "symbol_breakdown": compare_attribution.get("symbol", []),
             "trade_count": len(compare_attribution.get("trades", [])),
+            "alignment_quality": compare_attribution.get(
+                "alignment_quality",
+                self._default_alignment_quality(alignment_window_seconds),
+            ),
         }
     
     def _interpret_delta(self, value: float, delta_type: str) -> str:

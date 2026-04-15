@@ -167,14 +167,24 @@ async def test_wfa_metric_consistency(sample_kline_data):
     
     stability = result.get("stability_analysis", {})
     scores = stability.get("parameter_stability_scores", {})
-    
+    window_scores = stability.get("window_parameter_stability", [])
+     
     # Ensure it's a dict and values are standard floats, not numpy types
     assert isinstance(scores, dict)
-    
+    assert isinstance(window_scores, list)
+    assert len(window_scores) == len(result.get("walk_forward_results", []))
+     
     for key, val in scores.items():
         assert isinstance(key, str)
         # Check if val is exactly Python float (or int, which is serializable)
         assert type(val) in (float, int), f"Value {val} for key {key} is of type {type(val)}, not float"
+
+    for val in window_scores:
+        assert type(val) in (float, int), f"Window stability value {val} is of type {type(val)}, not float"
+
+    metric_types = result.get("metrics", {}).get("metric_types", {})
+    assert metric_types.get("avg_oos_annual_return") == "decimal"
+    assert metric_types.get("total_oos_return") == "percentage"
         
     # Test JSON serialization directly
     try:

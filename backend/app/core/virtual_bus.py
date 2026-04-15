@@ -1,12 +1,12 @@
 import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import pandas as pd
-import numpy as np
 
 from app.core.bus import ExecutionRouter, TradingBus
 from app.models.trading import OrderRequest, OrderResult, TradeSide, OrderStatus, BarData, TickData
+from app.services.metrics_calculator import MetricsCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class VirtualPerformanceMetric:
     _volatility: Optional[float] = 0.0
     _sortino_ratio: Optional[float] = 0.0
     _calmar_ratio: Optional[float] = 0.0
+    metric_types: Dict[str, str] = field(default_factory=dict)
 
     @property
     def annualized_return(self) -> float:
@@ -178,40 +179,21 @@ class VirtualExecutionRouter(ExecutionRouter):
             metric._total_return = float(total_return)
             return metric
             
-        df['returns'] = df['equity'].pct_change().fillna(0)
-        
-        total_return = (df['equity'].iloc[-1] - self.initial_capital) / self.initial_capital
-        metric._total_return = float(total_return)
-        
-        duration_days = (df.index[-1] - df.index[0]).total_seconds() / 86400
-        annualized_return = 0.0
-        if duration_days > 0:
-            annualized_return = (1 + total_return) ** (365 / duration_days) - 1
-            metric._annualized_return = float(annualized_return)
-        
-        cummax = df['equity'].cummax()
-        drawdown = (df['equity'] - cummax) / cummax
-        metric._max_drawdown_pct = float(abs(drawdown.min()))
-        
-        freq_secs = (df.index[1] - df.index[0]).total_seconds() if len(df) > 1 else 86400
-        periods_per_year = 365 * 86400 / freq_secs if freq_secs > 0 else 365
-        
-        daily_returns = df['returns']
-        volatility = daily_returns.std() * np.sqrt(periods_per_year)
-        metric._volatility = float(volatility)
-        
-        risk_free_rate = 0.0
-        if volatility > 0:
-            metric._sharpe_ratio = float((annualized_return - risk_free_rate) / volatility)
-        
-        negative_returns = daily_returns[daily_returns < 0]
-        downside_std = negative_returns.std() * np.sqrt(periods_per_year) if len(negative_returns) > 0 else 0
-        if downside_std > 0:
-            metric._sortino_ratio = float((annualized_return - risk_free_rate) / downside_std)
-            
-        if metric._max_drawdown_pct > 0:
-            metric._calmar_ratio = float(annualized_return / metric._max_drawdown_pct)
-            
+        standardized = MetricsCalculator.calculate_from_equity_points(
+            equity_points=self.equity_curve,
+            initial_capital=self.initial_capital,
+            total_trades=self.trade_count,
+            winning_trades=self.winning_trades,
+        )
+        metric._total_return = standardized.total_return
+        metric._annualized_return = standardized.annualized_return
+        metric._max_drawdown_pct = standardized.max_drawdown_pct
+        metric._volatility = standardized.volatility
+        metric._sharpe_ratio = standardized.sharpe_ratio
+        metric._sortino_ratio = standardized.sortino_ratio
+        metric._calmar_ratio = standardized.calmar_ratio
+        metric.metric_types = standardized.metric_type_names()
+
         return metric
 
 

@@ -1,23 +1,33 @@
 from datetime import datetime, timezone
 from typing import Optional
 from app.models.db_models import PerformanceMetric, StrategyEvaluation
+from app.services.metrics_calculator import StandardizedMetricsSnapshot
 
 class StrategyEvaluator:
     """策略评估器：计算策略的五维雷达图得分"""
     
+    @staticmethod
+    def _standardize_metrics(performance: PerformanceMetric) -> StandardizedMetricsSnapshot:
+        """
+        Normalize ORM / VirtualBus-style metrics to the canonical decimal schema.
+
+        Prefer explicit `metric_types` metadata when available.
+        Legacy percentage payloads fall back to heuristic normalization.
+        """
+        return StandardizedMetricsSnapshot.from_source(performance)
+
     @staticmethod
     def calculate_scores(performance: PerformanceMetric) -> dict:
         """
         计算综合得分（0-100分）
         包含：收益能力(30%)、风险控制(25%)、风险调整收益(25%)、稳定性(10%)、交易效率(10%)
         """
-        # VirtualBus outputs metrics in decimal format (e.g., 0.05 = 5%)
-        # No conversion needed - use values directly
-        annual_return = float(performance.annualized_return or 0)
-        max_drawdown = float(performance.max_drawdown_pct or 0)
-        sharpe_ratio = float(performance.sharpe_ratio or 0)
-        win_rate = float(performance.win_rate or 0)
-        num_trades = int(performance.total_trades or 0)
+        standardized = StrategyEvaluator._standardize_metrics(performance)
+        annual_return = standardized.annualized_return
+        max_drawdown = standardized.max_drawdown_pct
+        sharpe_ratio = standardized.sharpe_ratio
+        win_rate = standardized.win_rate
+        num_trades = standardized.total_trades
         
         # 1. 收益能力得分（0-30分）
         # 假设年化收益率20%为满分
@@ -70,6 +80,7 @@ class StrategyEvaluator:
             window_end: 评估窗口结束时间
             evaluation_date: 评估时间戳，如果为None则使用当前UTC时间
         """
+        standardized = self._standardize_metrics(performance)
         scores = self.calculate_scores(performance)
         
         # 使用传入的 evaluation_date，如果没有则使用当前UTC时间
@@ -81,16 +92,16 @@ class StrategyEvaluator:
             window_start=window_start,
             window_end=window_end,
             
-            # Base performance (VirtualBus outputs in decimal format, no conversion needed)
-            total_return=float(performance.total_return or 0),
-            annual_return=float(performance.annualized_return or 0),
-            volatility=float(performance.volatility or 0),
-            max_drawdown=float(performance.max_drawdown_pct or 0),
-            sharpe_ratio=float(performance.sharpe_ratio or 0),
-            sortino_ratio=float(performance.sortino_ratio or 0),
-            calmar_ratio=float(performance.calmar_ratio or 0),
-            win_rate=float(performance.win_rate or 0),
-            num_trades=int(performance.total_trades or 0),
+            # Base performance always uses the canonical decimal type system.
+            total_return=standardized.total_return,
+            annual_return=standardized.annualized_return,
+            volatility=standardized.volatility,
+            max_drawdown=standardized.max_drawdown_pct,
+            sharpe_ratio=standardized.sharpe_ratio,
+            sortino_ratio=standardized.sortino_ratio,
+            calmar_ratio=standardized.calmar_ratio,
+            win_rate=standardized.win_rate,
+            num_trades=standardized.total_trades,
             
             # Scores
             return_score=scores["return_score"],
