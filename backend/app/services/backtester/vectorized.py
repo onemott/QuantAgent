@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, Callable
 
-from app.services.backtester.annualization import annualize_return, annualize_sharpe, infer_annualization_factor
+from app.services.metrics_calculator import MetricsCalculator
 from app.services.backtester.signal_resolution import resolve_signal_output
 
 class VectorizedBacktester:
@@ -85,30 +85,38 @@ class VectorizedBacktester:
             final_position = self.initial_position
             
         final_capital = float(equity_curve.iloc[-1])
-        total_return = (final_capital / self.initial_capital - 1) * 100
-        annualization_factor = self.annualization_factor or infer_annualization_factor(self.df.index)
-        
-        annual_return = annualize_return(total_return / 100, max(len(self.df) - 1, 0), annualization_factor)
-        
-        # Max Drawdown
-        rolling_max = equity_curve.cummax()
-        drawdown = (equity_curve - rolling_max) / rolling_max
-        max_drawdown = abs(float(drawdown.min())) * 100
-        
-        sharpe_ratio = annualize_sharpe(net_returns, annualization_factor)
-            
         # Win Rate & Trade Stats (Approximate)
         # trades 变量记录了所有持仓变化的点（开仓和平仓）
         # 每次完整的买卖周期包含两次变化（开仓+平仓），所以交易对数 = trades_count / 2
         # 这只是近似统计，准确交易统计请使用 EventDriven 引擎
         total_trades = int((trades > 0).sum())
-        
+        metrics_snapshot = MetricsCalculator.calculate_from_returns(
+            index=self.df.index,
+            returns=net_returns,
+            initial_capital=self.initial_capital,
+            total_trades=total_trades,
+            winning_trades=0,
+            annualization_factor=self.annualization_factor,
+        )
+        display_metrics = metrics_snapshot.to_percentage_payload(include_legacy_aliases=True)
+        display_metric_types = dict(display_metrics["metric_types"])
+        display_metric_types["max_drawdown"] = "percentage"
+
         # Return simplified result
         return {
-            "total_return": total_return,
-            "annual_return": annual_return,
-            "max_drawdown": max_drawdown,
-            "sharpe_ratio": sharpe_ratio,
+            "total_return": display_metrics["total_return"],
+            "annual_return": display_metrics["annual_return"],
+            "annualized_return": display_metrics["annualized_return"],
+            "max_drawdown": display_metrics["max_drawdown_pct"],
+            "max_drawdown_pct": display_metrics["max_drawdown_pct"],
+            "max_drawdown_amount": display_metrics["max_drawdown_amount"],
+            "volatility": display_metrics["volatility"],
+            "sharpe_ratio": metrics_snapshot.sharpe_ratio,
+            "sortino_ratio": metrics_snapshot.sortino_ratio,
+            "calmar_ratio": metrics_snapshot.calmar_ratio,
+            "metric_types": display_metric_types,
+            "canonical_metrics": metrics_snapshot.dict(),
+            "annualization_factor": metrics_snapshot.annualization_factor,
             "total_trades": total_trades,
             "final_capital": final_capital,
             "final_position": final_position,

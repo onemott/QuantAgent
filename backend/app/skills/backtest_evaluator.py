@@ -4,8 +4,7 @@
 """
 
 import asyncio
-import json
-import random
+import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -15,6 +14,9 @@ import numpy as np
 
 from app.skills.core.base import BaseSkill
 from app.skills.core.models import SkillDefinition, SkillType
+
+
+logger = logging.getLogger(__name__)
 
 
 class BacktestEvaluatorSkill(BaseSkill):
@@ -30,6 +32,26 @@ class BacktestEvaluatorSkill(BaseSkill):
     输入：策略配置、历史数据
     输出：回测结果、性能指标、风险评估
     """
+
+    RISK_FREE_RATE = 0.03
+    SECONDS_PER_YEAR = 365.2425 * 24 * 60 * 60
+    MIN_OBSERVATIONS_FOR_RISK_METRICS = 2
+    INTERVAL_SECONDS = {
+        "1m": 60,
+        "3m": 180,
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "1h": 3600,
+        "2h": 7200,
+        "4h": 14400,
+        "6h": 21600,
+        "8h": 28800,
+        "12h": 43200,
+        "1d": 86400,
+        "3d": 259200,
+        "1w": 604800,
+    }
     
     def __init__(self, skill_definition: SkillDefinition):
         super().__init__(skill_definition)
@@ -461,86 +483,348 @@ class BacktestEvaluatorSkill(BaseSkill):
         market_data: Dict[str, Any],
         backtest_config: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """运行简化版回测（模拟）"""
-        
-        # 模拟回测结果
-        # 在实际项目中，这里应该调用真正的回测引擎
-        
+        """运行简化版回测，生成可验证的权益曲线与交易统计。"""
         strategy_type = strategy_config.get("type", "unknown")
         parameters = strategy_config.get("parameters", {})
-        
-        # 基于策略类型生成模拟结果
-        base_results = {
-            "trend_following": {
-                "total_return": 0.15 + (random.random() * 0.3),  # 15-45%
-                "sharpe_ratio": 0.8 + (random.random() * 1.2),   # 0.8-2.0
-                "max_drawdown": -0.1 - (random.random() * 0.2),  # -10% to -30%
-                "win_rate": 0.45 + (random.random() * 0.2),      # 45-65%
-                "total_trades": 50 + int(random.random() * 100),  # 50-150 trades
-                "volatility": 0.15 + (random.random() * 0.15)   # 15-30%
-            },
-            "mean_reversion": {
-                "total_return": 0.12 + (random.random() * 0.25),
-                "sharpe_ratio": 1.0 + (random.random() * 1.0),
-                "max_drawdown": -0.08 - (random.random() * 0.15),
-                "win_rate": 0.55 + (random.random() * 0.15),
-                "total_trades": 80 + int(random.random() * 120),
-                "volatility": 0.12 + (random.random() * 0.1)   # 12-22%
-            },
-            "breakout": {
-                "total_return": 0.2 + (random.random() * 0.4),
-                "sharpe_ratio": 0.6 + (random.random() * 1.4),
-                "max_drawdown": -0.15 - (random.random() * 0.25),
-                "win_rate": 0.4 + (random.random() * 0.2),
-                "total_trades": 30 + int(random.random() * 70),
-                "volatility": 0.25 + (random.random() * 0.2)   # 25-45%
-            },
-            "momentum": {
-                "total_return": 0.18 + (random.random() * 0.35),
-                "sharpe_ratio": 0.9 + (random.random() * 1.1),
-                "max_drawdown": -0.12 - (random.random() * 0.18),
-                "win_rate": 0.48 + (random.random() * 0.17),
-                "total_trades": 40 + int(random.random() * 90),
-                "volatility": 0.18 + (random.random() * 0.12)   # 18-30%
-            }
-        }
-        
-        # 获取基础结果
-        base_result = base_results.get(strategy_type, base_results["trend_following"])
-        
-        # 根据参数调整结果
+        initial_capital = float(backtest_config.get("initial_capital", 10000))
+        commission_rate = float(backtest_config.get("commission_rate", 0.001))
+        slippage = float(backtest_config.get("slippage", 0.0))
+        warnings: List[str] = []
+
+        ohlcv_df = market_data.get("ohlcv_df")
+        if not isinstance(ohlcv_df, pd.DataFrame) or ohlcv_df.empty or "close" not in ohlcv_df.columns:
+            warning = "缺少有效的 OHLCV 收盘价数据，无法执行回测。"
+            logger.warning(warning)
+            return self._build_empty_backtest_result(
+                initial_capital=initial_capital,
+                annualization_factor=1,
+                data_period_years=0.0,
+                data_period_days=0.0,
+                warnings=[warning],
+            )
+
+        price_frame = ohlcv_df.copy()
+        price_frame["close"] = pd.to_numeric(price_frame["close"], errors="coerce")
+        price_frame = price_frame.dropna(subset=["close"]).reset_index(drop=True)
+        if len(price_frame) < 2:
+            warning = "有效价格数据不足 2 条，无法计算收益率序列。"
+            logger.warning(warning)
+            return self._build_empty_backtest_result(
+                initial_capital=initial_capital,
+                annualization_factor=1,
+                data_period_years=0.0,
+                data_period_days=0.0,
+                warnings=[warning],
+            )
+
+        period_context = self._resolve_period_context(
+            market_data=market_data,
+            backtest_config=backtest_config,
+            observation_count=len(price_frame),
+        )
         param_adjustments = self._adjust_results_by_parameters(parameters, strategy_type)
-        
-        # 合并结果
-        result = {}
-        for key in base_result:
-            base_value = base_result[key]
-            adjustment = param_adjustments.get(key, 1.0)
-            
-            if isinstance(base_value, (int, float)):
-                # 添加随机噪声
-                noise = (random.random() - 0.5) * 0.1  # ±5%
-                result[key] = base_value * adjustment * (1 + noise)
-            else:
-                result[key] = base_value
-        
-        # 添加额外指标
-        initial_capital = backtest_config.get("initial_capital", 10000)
-        total_return = result.get("total_return", 0.15)
-        
-        result.update({
+        base_position_size = float(backtest_config.get("position_size", 0.1))
+        adjusted_position_size = min(
+            max(base_position_size * float(param_adjustments.get("total_return", 1.0)), 0.0),
+            1.0,
+        )
+
+        close_prices = pd.Series(price_frame["close"], dtype=float)
+        asset_returns = close_prices.pct_change().fillna(0.0)
+        raw_positions = self._generate_strategy_positions(close_prices, strategy_type, parameters)
+        positions = (raw_positions * adjusted_position_size).clip(lower=0.0, upper=1.0)
+        executed_positions = positions.shift(1).fillna(0.0)
+        turnover = executed_positions.diff().abs().fillna(executed_positions.abs())
+
+        total_cost_rate = commission_rate + slippage
+        strategy_returns = (executed_positions * asset_returns) - (turnover * total_cost_rate)
+        equity_curve = initial_capital * (1 + strategy_returns).cumprod()
+        final_capital = float(equity_curve.iloc[-1])
+        total_return = (final_capital / initial_capital - 1) if initial_capital > 0 else 0.0
+
+        commission_cash = (
+            turnover * commission_rate * equity_curve.shift(1).fillna(initial_capital)
+        ).sum()
+        trade_stats = self._extract_trade_statistics(
+            close_prices=close_prices,
+            executed_positions=raw_positions.shift(1).fillna(0.0),
+            commission_rate=commission_rate,
+            slippage=slippage,
+        )
+        warnings.extend(trade_stats.pop("warnings", []))
+
+        return {
             "initial_capital": initial_capital,
-            "final_capital": initial_capital * (1 + total_return),
-            "total_commission": initial_capital * total_return * 0.01,  # 假设1%手续费
-            "winning_trades": int(result.get("total_trades", 100) * result.get("win_rate", 0.5)),
-            "losing_trades": int(result.get("total_trades", 100) * (1 - result.get("win_rate", 0.5))),
-            "avg_win": total_return * 0.3 / max(1, result.get("winning_trades", 1)),
-            "avg_loss": -total_return * 0.2 / max(1, result.get("losing_trades", 1)),
-            "largest_win": total_return * 0.5,
-            "largest_loss": -total_return * 0.4
-        })
-        
-        return result
+            "final_capital": final_capital,
+            "total_return": total_return,
+            "total_commission": float(commission_cash),
+            "period_returns": strategy_returns.tolist(),
+            "equity_curve": equity_curve.tolist(),
+            "annualization_factor": period_context["annualization_factor"],
+            "data_period_years": period_context["data_period_years"],
+            "data_period_days": period_context["data_period_days"],
+            "position_size": adjusted_position_size,
+            "warnings": warnings,
+            **trade_stats,
+        }
+
+    def _build_empty_backtest_result(
+        self,
+        initial_capital: float,
+        annualization_factor: int,
+        data_period_years: float,
+        data_period_days: float,
+        warnings: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """构建零交易/无数据场景的统一回测结果。"""
+        return {
+            "initial_capital": initial_capital,
+            "final_capital": initial_capital,
+            "total_return": 0.0,
+            "total_commission": 0.0,
+            "period_returns": [],
+            "equity_curve": [initial_capital],
+            "trade_returns": [],
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "largest_win": 0.0,
+            "largest_loss": 0.0,
+            "win_rate": 0.0,
+            "annualization_factor": annualization_factor,
+            "data_period_years": data_period_years,
+            "data_period_days": data_period_days,
+            "warnings": warnings or [],
+        }
+
+    def _resolve_period_context(
+        self,
+        market_data: Dict[str, Any],
+        backtest_config: Dict[str, Any],
+        observation_count: int,
+    ) -> Dict[str, Any]:
+        """
+        基于真实数据跨度推导年化参数。
+
+        优先使用 OHLCV 时间戳，其次回退到 test_periods，再其次用 interval * 数据点数估算。
+        """
+        timestamps = self._extract_market_timestamps(market_data)
+        bar_seconds = self._infer_interval_seconds(market_data.get("interval", "1d"))
+
+        if len(timestamps) >= 2:
+            diffs = pd.Series(timestamps).diff().dropna().dt.total_seconds()
+            positive_diffs = diffs[diffs > 0]
+            if not positive_diffs.empty:
+                bar_seconds = float(positive_diffs.median())
+            period_seconds = float((timestamps[-1] - timestamps[0]).total_seconds())
+        else:
+            period_seconds = self._extract_test_period_seconds(backtest_config)
+            if period_seconds <= 0:
+                period_seconds = float(max(observation_count - 1, 1) * bar_seconds)
+
+        annualization_factor = max(int(round(self.SECONDS_PER_YEAR / max(bar_seconds, 1.0))), 1)
+        data_period_years = max(period_seconds / self.SECONDS_PER_YEAR, 1.0 / annualization_factor)
+        data_period_days = period_seconds / 86400 if period_seconds > 0 else 0.0
+
+        return {
+            "annualization_factor": annualization_factor,
+            "data_period_years": float(data_period_years),
+            "data_period_days": float(data_period_days),
+        }
+
+    def _extract_market_timestamps(self, market_data: Dict[str, Any]) -> List[datetime]:
+        """从市场数据中提取并排序时间戳。"""
+        ohlcv_df = market_data.get("ohlcv_df")
+        raw_timestamps: List[Any] = []
+
+        if isinstance(ohlcv_df, pd.DataFrame) and "timestamp" in ohlcv_df.columns:
+            raw_timestamps = ohlcv_df["timestamp"].tolist()
+        else:
+            ohlcv = market_data.get("ohlcv", [])
+            raw_timestamps = [
+                item.get("timestamp")
+                for item in ohlcv
+                if isinstance(item, dict) and item.get("timestamp") is not None
+            ]
+
+        if not raw_timestamps:
+            return []
+
+        timestamp_series = pd.Series(raw_timestamps)
+        if pd.api.types.is_numeric_dtype(timestamp_series):
+            median_value = float(timestamp_series.dropna().abs().median()) if not timestamp_series.dropna().empty else 0.0
+            unit = "ms" if median_value >= 1e12 else "s"
+            parsed = pd.to_datetime(timestamp_series, unit=unit, errors="coerce", utc=True)
+        else:
+            parsed = pd.to_datetime(timestamp_series, errors="coerce", utc=True)
+
+        parsed_index = pd.DatetimeIndex(parsed.dropna()).sort_values().unique()
+        return [ts.to_pydatetime() for ts in parsed_index]
+
+    def _extract_test_period_seconds(self, backtest_config: Dict[str, Any]) -> float:
+        """从配置中的测试区间提取总跨度，作为时间戳缺失时的回退方案。"""
+        test_periods = backtest_config.get("test_periods", [])
+        if not test_periods:
+            return 0.0
+
+        parsed_bounds: List[Tuple[datetime, datetime]] = []
+        for period in test_periods:
+            start = pd.to_datetime(period.get("start"), errors="coerce")
+            end = pd.to_datetime(period.get("end"), errors="coerce")
+            if pd.isna(start) or pd.isna(end):
+                continue
+            parsed_bounds.append((start.to_pydatetime(), end.to_pydatetime()))
+
+        if not parsed_bounds:
+            return 0.0
+
+        start_dt = min(bound[0] for bound in parsed_bounds)
+        end_dt = max(bound[1] for bound in parsed_bounds)
+        return float(max((end_dt - start_dt).total_seconds(), 0.0))
+
+    def _infer_interval_seconds(self, interval: str) -> int:
+        """将常见 K 线周期解析为秒数。"""
+        normalized_interval = str(interval or "1d").strip().lower()
+        if normalized_interval in self.INTERVAL_SECONDS:
+            return self.INTERVAL_SECONDS[normalized_interval]
+
+        if normalized_interval.endswith("m") and normalized_interval[:-1].isdigit():
+            return int(normalized_interval[:-1]) * 60
+        if normalized_interval.endswith("h") and normalized_interval[:-1].isdigit():
+            return int(normalized_interval[:-1]) * 3600
+        if normalized_interval.endswith("d") and normalized_interval[:-1].isdigit():
+            return int(normalized_interval[:-1]) * 86400
+
+        return 86400
+
+    def _generate_strategy_positions(
+        self,
+        close_prices: pd.Series,
+        strategy_type: str,
+        parameters: Dict[str, Any],
+    ) -> pd.Series:
+        """根据策略类型生成简化版 long-only 持仓序列。"""
+        close_prices = pd.Series(close_prices, dtype=float)
+
+        if strategy_type == "trend_following":
+            fast_period = max(int(parameters.get("ma_fast_period", 5)), 1)
+            slow_period = max(int(parameters.get("ma_slow_period", 20)), fast_period + 1)
+            fast_ma = close_prices.rolling(window=fast_period, min_periods=fast_period).mean()
+            slow_ma = close_prices.rolling(window=slow_period, min_periods=slow_period).mean()
+            return (fast_ma > slow_ma).astype(float).fillna(0.0)
+
+        if strategy_type == "mean_reversion":
+            rsi_period = max(int(parameters.get("rsi_period", 14)), 2)
+            oversold = float(parameters.get("oversold_threshold", 30.0))
+            exit_rsi = float(parameters.get("exit_rsi", 55.0))
+            rsi = self._calculate_rsi(close_prices, rsi_period)
+            return self._build_stateful_position(rsi < oversold, rsi > exit_rsi, close_prices.index)
+
+        if strategy_type == "breakout":
+            breakout_period = max(int(parameters.get("breakout_period", 20)), 2)
+            rolling_high = close_prices.shift(1).rolling(window=breakout_period, min_periods=breakout_period).max()
+            rolling_low = close_prices.shift(1).rolling(window=breakout_period, min_periods=breakout_period).min()
+            return self._build_stateful_position(close_prices > rolling_high, close_prices < rolling_low, close_prices.index)
+
+        if strategy_type == "momentum":
+            lookback_period = max(int(parameters.get("lookback_period", 10)), 1)
+            entry_threshold = float(parameters.get("entry_threshold", 0.0))
+            momentum = close_prices.pct_change(lookback_period)
+            return self._build_stateful_position(momentum > entry_threshold, momentum < 0, close_prices.index)
+
+        fallback_signal = close_prices.pct_change().rolling(window=5, min_periods=5).mean()
+        return (fallback_signal > 0).astype(float).fillna(0.0)
+
+    def _build_stateful_position(
+        self,
+        entry_signal: pd.Series,
+        exit_signal: pd.Series,
+        index: pd.Index,
+    ) -> pd.Series:
+        """将离散的入场/出场条件转换为持仓状态。"""
+        position_state = pd.Series(0.0, index=index, dtype=float)
+        current_position = 0.0
+
+        for idx in index:
+            if bool(entry_signal.loc[idx]):
+                current_position = 1.0
+            elif bool(exit_signal.loc[idx]):
+                current_position = 0.0
+            position_state.loc[idx] = current_position
+
+        return position_state
+
+    def _calculate_rsi(self, close_prices: pd.Series, period: int) -> pd.Series:
+        """计算 RSI，用于均值回归策略的简化信号。"""
+        delta = close_prices.diff()
+        gains = delta.clip(lower=0.0)
+        losses = -delta.clip(upper=0.0)
+
+        avg_gain = gains.rolling(window=period, min_periods=period).mean()
+        avg_loss = losses.rolling(window=period, min_periods=period).mean()
+        relative_strength = avg_gain / avg_loss.replace(0.0, np.nan)
+        rsi = 100 - (100 / (1 + relative_strength))
+        return rsi.fillna(50.0)
+
+    def _extract_trade_statistics(
+        self,
+        close_prices: pd.Series,
+        executed_positions: pd.Series,
+        commission_rate: float,
+        slippage: float,
+    ) -> Dict[str, Any]:
+        """基于真实进出场序列统计交易结果，不再伪造平均盈亏。"""
+        position_state = pd.Series(executed_positions, dtype=float).fillna(0.0).clip(lower=0.0, upper=1.0)
+        trade_returns: List[float] = []
+        in_position = False
+        entry_price = 0.0
+
+        for i, current_price in enumerate(close_prices):
+            current_signal = float(position_state.iloc[i])
+            previous_signal = float(position_state.iloc[i - 1]) if i > 0 else 0.0
+
+            if not in_position and previous_signal <= 0.0 and current_signal > 0.0:
+                entry_price = float(current_price)
+                in_position = True
+                continue
+
+            if in_position and previous_signal > 0.0 and current_signal <= 0.0:
+                exit_price = float(current_price)
+                gross_return = (exit_price / entry_price - 1) if entry_price > 0 else 0.0
+                net_return = gross_return - (2 * commission_rate) - slippage
+                trade_returns.append(float(net_return))
+                in_position = False
+
+        if in_position and entry_price > 0:
+            final_price = float(close_prices.iloc[-1])
+            gross_return = final_price / entry_price - 1
+            net_return = gross_return - commission_rate - slippage
+            trade_returns.append(float(net_return))
+
+        trade_returns_series = pd.Series(trade_returns, dtype=float)
+        winning_trades = trade_returns_series[trade_returns_series > 0]
+        losing_trades = trade_returns_series[trade_returns_series < 0]
+        total_trades = int(len(trade_returns_series))
+        warnings: List[str] = []
+
+        if total_trades == 0:
+            warnings.append("策略在测试区间内未产生任何交易。")
+            logger.warning("Backtest evaluator produced zero trades for the current strategy window.")
+
+        return {
+            "trade_returns": trade_returns_series.tolist(),
+            "total_trades": total_trades,
+            "winning_trades": int(len(winning_trades)),
+            "losing_trades": int(len(losing_trades)),
+            "win_rate": float(len(winning_trades) / total_trades) if total_trades > 0 else 0.0,
+            "avg_win": float(winning_trades.mean()) if not winning_trades.empty else 0.0,
+            "avg_loss": float(losing_trades.mean()) if not losing_trades.empty else 0.0,
+            "largest_win": float(winning_trades.max()) if not winning_trades.empty else 0.0,
+            "largest_loss": float(losing_trades.min()) if not losing_trades.empty else 0.0,
+            "warnings": warnings,
+        }
     
     def _adjust_results_by_parameters(self, parameters: Dict[str, Any], strategy_type: str) -> Dict[str, float]:
         """根据策略参数调整结果"""
@@ -580,63 +864,170 @@ class BacktestEvaluatorSkill(BaseSkill):
         return adjustments
     
     def _calculate_performance_metrics(self, backtest_result: Dict[str, Any]) -> Dict[str, Any]:
-        """计算性能指标"""
-        total_return = backtest_result.get("total_return", 0)
-        sharpe_ratio = backtest_result.get("sharpe_ratio", 0)
-        max_drawdown = backtest_result.get("max_drawdown", 0)
-        win_rate = backtest_result.get("win_rate", 0)
-        total_trades = backtest_result.get("total_trades", 0)
-            
-        # 计算额外指标
-        if max_drawdown != 0:
-            calmar_ratio = total_return / abs(max_drawdown)
+        """基于收益率序列、权益曲线和真实交易统计重新计算性能指标。"""
+        warnings = list(backtest_result.get("warnings", []))
+        initial_capital = float(backtest_result.get("initial_capital", 0) or 0.0)
+        final_capital = float(backtest_result.get("final_capital", initial_capital) or initial_capital)
+        total_return = (
+            (final_capital / initial_capital - 1)
+            if initial_capital > 0
+            else float(backtest_result.get("total_return", 0.0) or 0.0)
+        )
+        annualization_factor = int(backtest_result.get("annualization_factor", 1) or 1)
+        data_period_years = float(backtest_result.get("data_period_years", 0.0) or 0.0)
+
+        period_returns = pd.Series(backtest_result.get("period_returns", []), dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+        equity_curve = [float(v) for v in backtest_result.get("equity_curve", []) if v is not None]
+        trade_returns = pd.Series(backtest_result.get("trade_returns", []), dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+
+        max_drawdown, max_drawdown_duration = self._calculate_max_drawdown(equity_curve)
+        annual_return = self._annualize_total_return(total_return, data_period_years)
+        volatility = self._calculate_annualized_volatility(period_returns, annualization_factor)
+        sharpe_ratio = self._calculate_sharpe_ratio(period_returns, annualization_factor, self.RISK_FREE_RATE)
+        downside_deviation = self._calculate_downside_deviation(period_returns, annualization_factor, self.RISK_FREE_RATE)
+
+        if volatility <= 0:
+            warnings.append("波动率为 0 或数据不足，夏普比率按 0 处理。")
+            logger.warning("Backtest evaluator volatility is zero or undefined; Sharpe ratio set to 0.")
+            volatility = 0.0
+            sharpe_ratio = 0.0
+
+        if downside_deviation <= 0:
+            warnings.append("下行波动率为 0 或数据不足，Sortino 比率按 0 处理。")
+            logger.warning("Backtest evaluator downside deviation is zero or undefined; Sortino ratio set to 0.")
+            sortino_ratio = 0.0
         else:
-            calmar_ratio = 0
-    
-        # 简化的Sortino比率（假设下行波动是总波动的一半）
-        sortino_ratio = sharpe_ratio * 1.2 if sharpe_ratio > 0 else 0
-    
-        avg_win = backtest_result.get("avg_win", 0)
-        avg_loss = backtest_result.get("avg_loss", 0)
-    
-        if avg_loss != 0:
-            profit_factor = (avg_win * win_rate) / (abs(avg_loss) * (1 - win_rate))
+            sortino_ratio = (annual_return - self.RISK_FREE_RATE) / downside_deviation
+
+        if max_drawdown < 0:
+            calmar_ratio = annual_return / abs(max_drawdown)
         else:
-            profit_factor = 10 if avg_win > 0 else 0
-            
-        # 计算波动率（年化）
-        # 基于夏普比率反推：sharpe = return / volatility
-        # 如果夏普比率存在，volatility = return / sharpe
-        # 否则使用经验估计
-        volatility = backtest_result.get("volatility", 0)
-        if volatility == 0 and sharpe_ratio > 0:
-            # 假设年化收益率为 total_return * 2（6个月数据年化）
-            annual_return = total_return * 2
-            volatility = annual_return / sharpe_ratio if sharpe_ratio > 0 else 0
-        elif volatility == 0:
-            # 使用经验估计：波动率通常在 15%-50% 范围
-            volatility = 0.25  # 默认 25%
-    
+            calmar_ratio = 0.0
+
+        total_trades = int(len(trade_returns))
+        winning_trades = int((trade_returns > 0).sum())
+        losing_trades = int((trade_returns < 0).sum())
+        win_rate = float(winning_trades / total_trades) if total_trades > 0 else 0.0
+
+        if total_trades == 0:
+            warnings.append("零交易策略：胜率、盈亏比和期望值均按 0 处理。")
+            logger.warning("Backtest evaluator encountered a zero-trade strategy.")
+
+        avg_win = float(trade_returns[trade_returns > 0].mean()) if winning_trades > 0 else 0.0
+        avg_loss = float(trade_returns[trade_returns < 0].mean()) if losing_trades > 0 else 0.0
+        largest_win = float(trade_returns[trade_returns > 0].max()) if winning_trades > 0 else 0.0
+        largest_loss = float(trade_returns[trade_returns < 0].min()) if losing_trades > 0 else 0.0
+
+        gross_profit = float(trade_returns[trade_returns > 0].sum()) if winning_trades > 0 else 0.0
+        gross_loss = float(abs(trade_returns[trade_returns < 0].sum())) if losing_trades > 0 else 0.0
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        else:
+            profit_factor = 0.0
+            if gross_profit > 0:
+                warnings.append("不存在亏损交易，盈利因子无法按标准公式定义，已按 0 处理。")
+
+        expectancy = float(trade_returns.mean()) if total_trades > 0 else 0.0
+
         return {
             "total_return": round(total_return, 4),
-            "annual_return": round(total_return * 2, 4),  # 简化：假设6个月数据
+            "annual_return": round(annual_return, 4),
             "sharpe_ratio": round(sharpe_ratio, 3),
             "sortino_ratio": round(sortino_ratio, 3),
             "calmar_ratio": round(calmar_ratio, 3),
             "max_drawdown": round(max_drawdown, 4),
-            "max_drawdown_duration": int(abs(max_drawdown) * 100),  # 模拟
+            "max_drawdown_duration": max_drawdown_duration,
             "win_rate": round(win_rate, 3),
             "profit_factor": round(profit_factor, 3),
             "volatility": round(volatility, 4),
+            "downside_deviation": round(downside_deviation, 4),
+            "risk_free_rate": self.RISK_FREE_RATE,
             "total_trades": total_trades,
-            "winning_trades": backtest_result.get("winning_trades", 0),
-            "losing_trades": backtest_result.get("losing_trades", 0),
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
             "avg_win": round(avg_win, 4),
             "avg_loss": round(avg_loss, 4),
-            "largest_win": round(backtest_result.get("largest_win", 0), 4),
-            "largest_loss": round(backtest_result.get("largest_loss", 0), 4),
-            "expectancy": round(avg_win * win_rate + avg_loss * (1 - win_rate), 4)
+            "largest_win": round(largest_win, 4),
+            "largest_loss": round(largest_loss, 4),
+            "expectancy": round(expectancy, 4),
+            "warnings": warnings,
         }
+
+    def _calculate_max_drawdown(self, equity_curve: List[float]) -> Tuple[float, int]:
+        """基于权益曲线独立计算最大回撤与最长回撤持续期。"""
+        if len(equity_curve) < 2:
+            return 0.0, 0
+
+        equity_series = pd.Series(equity_curve, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(equity_series) < 2:
+            return 0.0, 0
+
+        rolling_peak = equity_series.cummax()
+        drawdown = (equity_series - rolling_peak) / rolling_peak.replace(0.0, np.nan)
+        drawdown = drawdown.fillna(0.0)
+
+        current_duration = 0
+        max_duration = 0
+        for value in drawdown:
+            if value < 0:
+                current_duration += 1
+                max_duration = max(max_duration, current_duration)
+            else:
+                current_duration = 0
+
+        return float(drawdown.min()), int(max_duration)
+
+    def _annualize_total_return(self, total_return: float, data_period_years: float) -> float:
+        """按真实数据跨度计算年化收益率。"""
+        if data_period_years <= 0:
+            return 0.0
+        if total_return <= -1.0:
+            return -1.0
+        return float((1 + total_return) ** (1 / data_period_years) - 1)
+
+    def _calculate_annualized_volatility(self, period_returns: pd.Series, annualization_factor: int) -> float:
+        """计算年化波动率；数据不足或标准差为 0 时返回 0。"""
+        if len(period_returns) < self.MIN_OBSERVATIONS_FOR_RISK_METRICS or annualization_factor <= 0:
+            return 0.0
+
+        volatility = float(period_returns.std(ddof=1) * np.sqrt(annualization_factor))
+        return volatility if np.isfinite(volatility) and volatility > 0 else 0.0
+
+    def _calculate_sharpe_ratio(
+        self,
+        period_returns: pd.Series,
+        annualization_factor: int,
+        risk_free_rate: float,
+    ) -> float:
+        """按标准公式计算夏普比率。"""
+        if len(period_returns) < self.MIN_OBSERVATIONS_FOR_RISK_METRICS or annualization_factor <= 0:
+            return 0.0
+
+        risk_free_per_period = risk_free_rate / annualization_factor
+        excess_returns = period_returns - risk_free_per_period
+        excess_std = float(excess_returns.std(ddof=1))
+        if not np.isfinite(excess_std) or excess_std <= 0:
+            return 0.0
+
+        return float((excess_returns.mean() / excess_std) * np.sqrt(annualization_factor))
+
+    def _calculate_downside_deviation(
+        self,
+        period_returns: pd.Series,
+        annualization_factor: int,
+        risk_free_rate: float,
+    ) -> float:
+        """计算年化下行波动率，用于 Sortino 比率。"""
+        if len(period_returns) < self.MIN_OBSERVATIONS_FOR_RISK_METRICS or annualization_factor <= 0:
+            return 0.0
+
+        risk_free_per_period = risk_free_rate / annualization_factor
+        downside_excess = np.minimum(period_returns - risk_free_per_period, 0.0)
+        downside_variance = float(np.mean(np.square(downside_excess)))
+        if not np.isfinite(downside_variance) or downside_variance <= 0:
+            return 0.0
+
+        return float(np.sqrt(downside_variance) * np.sqrt(annualization_factor))
     
     def _assess_risk(self, performance_metrics: Dict[str, Any], strategy_config: Dict[str, Any]) -> Dict[str, Any]:
         """风险评估"""

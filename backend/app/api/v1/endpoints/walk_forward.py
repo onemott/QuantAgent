@@ -25,15 +25,15 @@ class WFORunRequest(BaseModel):
     strategy_type: str = Field(..., description="Strategy identifier, e.g., 'ma', 'rsi'")
     symbol: str = Field("BTCUSDT", description="Trading pair symbol")
     interval: str = Field("1d", description="Candle interval, e.g., '1h', '1d'")
-    is_days: int = Field(180, description="In-sample window size in days")
-    oos_days: int = Field(60, description="Out-of-sample window size in days")
-    step_days: int = Field(60, description="Step size in days")
+    is_days: int = Field(180, ge=1, description="In-sample window size in days")
+    oos_days: int = Field(60, ge=1, description="Out-of-sample window size in days")
+    step_days: int = Field(60, ge=1, description="Step size in days")
     start_time: datetime = Field(..., description="Start time for the whole dataset")
     end_time: datetime = Field(..., description="End time for the whole dataset")
-    initial_capital: float = Field(10000.0, description="Initial capital for backtesting")
-    n_trials: int = Field(30, description="Number of trials for Optuna optimization")
+    initial_capital: float = Field(10000.0, gt=0, description="Initial capital for backtesting")
+    n_trials: int = Field(30, ge=1, description="Number of trials for Optuna optimization")
     use_numba: bool = Field(False, description="Whether to use numba for backtest acceleration")
-    embargo_days: int = Field(0, description="Embargo days to prevent data leakage")
+    embargo_days: int = Field(0, ge=0, description="Embargo days to prevent data leakage")
 
 class WFORunResponse(BaseModel):
     session_id: int
@@ -155,6 +155,7 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
                     "overall_wfe": wfo_result["metrics"].get("overall_wfe", 0.0),
                     "avg_oos_annual_return": wfo_result["metrics"].get("avg_oos_annual_return", 0.0),
                     "total_oos_trades": wfo_result["metrics"].get("total_oos_trades", 0),
+                    "metric_types": wfo_result["metrics"].get("metric_types", {}),
                     "stability_analysis": wfo_result.get("stability_analysis", {})
                 }
                 
@@ -188,16 +189,28 @@ async def run_wfo_task(session_id: int, req: WFORunRequest):
                         best_params=w["best_params"],
                         is_metrics={
                             "sharpe": w.get("is_sharpe", 0.0),
-                            "return": w.get("is_return", 0.0)
+                            "return": w.get("is_return", 0.0),
+                            "metric_types": {
+                                "sharpe": "decimal",
+                                "return": "percentage",
+                            },
                         },
                         oos_metrics={
                             "sharpe": w.get("oos_sharpe", 0.0),
                             "return": w.get("oos_return", 0.0),
+                            "annual_return": w.get("oos_annual_return", 0.0),
                             "drawdown": w.get("oos_drawdown", 0.0),
-                            "trades": w.get("oos_trades", 0)
+                            "trades": w.get("oos_trades", 0),
+                            "metric_types": {
+                                "sharpe": "decimal",
+                                "return": "percentage",
+                                "annual_return": "decimal",
+                                "drawdown": "percentage",
+                                "trades": "absolute_value",
+                            },
                         },
                         wfe=wfe_value,
-                        param_stability=stability_analysis.get("parameter_stability_scores", {}).get(str(i))
+                        param_stability=w.get("param_stability"),
                     )
                     session_db.add(win)
                     

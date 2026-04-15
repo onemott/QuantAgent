@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 
 from app.services.database import get_db
 from app.services.performance_service import performance_service
+from app.services.metrics_calculator import MetricsCalculator, StandardizedMetricsSnapshot
 from app.models.db_models import ReplaySession, BacktestResult, EquitySnapshot, PaperTrade
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,22 @@ def compute_params_hash(params: dict) -> str:
 
 
 class ReplayMetricsService:
+
+    @staticmethod
+    def build_common_metrics_from_equity_points(
+        *,
+        equity_points: List[Dict[str, Any]],
+        initial_capital: float,
+        total_trades: int,
+        winning_trades: int,
+    ) -> StandardizedMetricsSnapshot:
+        """Pure helper for replay/backtest alignment tests and session metric recomputation."""
+        return MetricsCalculator.calculate_from_equity_points(
+            equity_points=equity_points,
+            initial_capital=initial_capital,
+            total_trades=total_trades,
+            winning_trades=winning_trades,
+        )
 
     async def compute_and_store_metrics(self, session_id: str) -> Dict[str, Any]:
         """
@@ -67,6 +84,34 @@ class ReplayMetricsService:
                 initial_capital=initial_capital,
                 session_id=session_id,
             )
+
+            common_metrics = await self._calculate_common_metrics_from_snapshots(
+                session=session,
+                session_id=session_id,
+                initial_capital=initial_capital,
+                total_trades=int(metrics.get("total_trades", 0) or 0),
+                winning_trades=int(metrics.get("winning_trades", 0) or 0),
+            )
+            if common_metrics is not None:
+                display_metrics = common_metrics.to_percentage_payload()
+                display_metric_types = dict(display_metrics["metric_types"])
+                display_metric_types["max_drawdown"] = "absolute_value"
+                metrics.update(
+                    {
+                        "total_return": round(display_metrics["total_return"], 2),
+                        "annualized_return": round(display_metrics["annualized_return"], 2),
+                        "max_drawdown": round(common_metrics.max_drawdown, 2),
+                        "max_drawdown_amount": round(display_metrics["max_drawdown_amount"], 2),
+                        "max_drawdown_pct": round(display_metrics["max_drawdown_pct"], 2),
+                        "volatility": round(display_metrics["volatility"], 2),
+                        "sharpe_ratio": round(common_metrics.sharpe_ratio, 2),
+                        "sortino_ratio": round(common_metrics.sortino_ratio, 2),
+                        "calmar_ratio": round(common_metrics.calmar_ratio, 2),
+                        "annualization_factor": common_metrics.annualization_factor,
+                        "metric_types": display_metric_types,
+                        "canonical_metrics": common_metrics.dict(),
+                    }
+                )
 
             # 4. Validate: computed total_trades should be reasonable
             computed_total_trades = metrics.get("total_trades", 0)
@@ -123,6 +168,46 @@ class ReplayMetricsService:
                 f"win_rate={metrics.get('win_rate', 'N/A')}"
             )
             return metrics
+
+    async def _calculate_common_metrics_from_snapshots(
+        self,
+        *,
+        session,
+        session_id: str,
+        initial_capital: float,
+        total_trades: int,
+        winning_trades: int,
+    ) -> Optional[StandardizedMetricsSnapshot]:
+        """
+        Build canonical replay metrics directly from equity snapshots.
+
+        This keeps replay annualization and return math aligned with the backtest chain.
+        """
+        stmt = (
+            select(EquitySnapshot)
+            .where(EquitySnapshot.session_id == session_id)
+            .order_by(EquitySnapshot.timestamp.asc())
+        )
+        result = await session.execute(stmt)
+        snapshots = result.scalars().all()
+        equity_points = [
+            {
+                "timestamp": snapshot.timestamp,
+                "equity": float(snapshot.total_equity),
+            }
+            for snapshot in snapshots
+            if snapshot.timestamp is not None and snapshot.total_equity is not None
+        ]
+        if not equity_points:
+            logger.warning("[Replay Metrics] No equity snapshots found for session %s; skipping common metrics alignment.", session_id)
+            return None
+
+        return self.build_common_metrics_from_equity_points(
+            equity_points=equity_points,
+            initial_capital=initial_capital,
+            total_trades=total_trades,
+            winning_trades=winning_trades,
+        )
 
     async def suggest_backtest_matches(
         self, session_id: str, limit: int = 3
