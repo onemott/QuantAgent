@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -64,9 +64,22 @@ export interface AtomicStrategyPanelProps {
     low_score_threshold: number;
     min_strategies: number;
   }) => void;
+  // 复活规则参数
+  revivalRule?: {
+    revival_score_threshold: number;
+    min_consecutive_high: number;
+    max_revival_per_round: number;
+  };
+  onRevivalRuleChange?: (rule: {
+    revival_score_threshold: number;
+    min_consecutive_high: number;
+    max_revival_per_round: number;
+  }) => void;
   perStrategyCapital?: number;
   onPerStrategyCapitalChange?: (value: number) => void;
   interval?: string;
+  dateRange?: { start: string; end: string };
+  isEvalPeriodManual?: boolean;
 }
 
 const WEIGHT_METHOD_OPTIONS = [
@@ -97,9 +110,17 @@ export function AtomicStrategyPanel({
     min_strategies: 2,
   },
   onEliminationRuleChange,
+  revivalRule = {
+    revival_score_threshold: 45,
+    min_consecutive_high: 2,
+    max_revival_per_round: 2,
+  },
+  onRevivalRuleChange,
   perStrategyCapital,
   onPerStrategyCapitalChange,
   interval = "1m",
+  dateRange,
+  isEvalPeriodManual = false,
 }: AtomicStrategyPanelProps) {
   const [showGlobalConfig, setShowGlobalConfig] = useState(false);
 
@@ -128,6 +149,32 @@ export function AtomicStrategyPanel({
       return `约 ${Math.round(totalMinutes / 43200)} 月`;
     }
   }, [evaluationPeriod, interval]);
+
+  // 计算总 K 线数量和预计评估次数
+  const evaluationStats = useMemo(() => {
+    if (!dateRange?.start || !dateRange?.end) return null;
+
+    const intervalMinutes = INTERVAL_MINUTES[interval];
+    if (!intervalMinutes) return null;
+
+    const startDate = new Date(dateRange.start);
+    const endDate = new Date(dateRange.end);
+    const totalMinutes = (endDate.getTime() - startDate.getTime()) / (1000 * 60);
+    
+    if (totalMinutes <= 0) return null;
+
+    const totalBars = Math.floor(totalMinutes / intervalMinutes);
+    if (totalBars <= 0) return null;
+
+    const estimatedEvaluations = Math.floor(totalBars / evaluationPeriod);
+    const recommendedPeriod = Math.max(50, Math.min(Math.floor(totalBars * 0.8), Math.round(totalBars / 8)));
+
+    return {
+      totalBars,
+      estimatedEvaluations,
+      recommendedPeriod,
+    };
+  }, [dateRange, interval, evaluationPeriod]);
 
   // Filter valid templates (exclude dynamic_selection itself or templates not supporting replay)
   const validTemplates = useMemo(() => {
@@ -420,6 +467,14 @@ export function AtomicStrategyPanel({
                 <p className="text-[10px] text-slate-600">
                   每 {evaluationPeriod} 根 K 线触发一次评估（{formatEvaluationTime} @ {interval} K线）
                 </p>
+                {evaluationStats && (
+                  <p className={`text-[10px] ${isEvalPeriodManual ? 'text-amber-400' : 'text-emerald-400'}`}>
+                    {isEvalPeriodManual 
+                      ? `手动设置（自动推荐值：${evaluationStats.recommendedPeriod}，约 ${Math.floor(evaluationStats.totalBars / evaluationStats.recommendedPeriod)} 次评估）`
+                      : `自动推荐：预计共 ${evaluationStats.totalBars.toLocaleString()} 根 K 线，约 ${evaluationStats.estimatedEvaluations} 次评估`
+                    }
+                  </p>
+                )}
               </div>
 
               {/* Weight Method */}
@@ -550,6 +605,58 @@ export function AtomicStrategyPanel({
                     />
                   </div>
                 </div>
+              </div>
+
+              {/* Revival Rule */}
+              <div className="space-y-3 pt-2 border-t border-slate-700/50">
+                <Label className="text-xs text-slate-500">复活规则 (revival_rule)</Label>
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="space-y-1.5">
+                    <Label className="text-[10px] text-slate-400">复活评分阈值</Label>
+                    <Input
+                      type="number"
+                      value={revivalRule.revival_score_threshold}
+                      onChange={(e) =>
+                        onRevivalRuleChange?.({
+                          ...revivalRule,
+                          revival_score_threshold: Math.max(0, Math.min(100, parseFloat(e.target.value) || 0)),
+                        })
+                      }
+                      className="h-7 text-xs bg-slate-800/50 border-slate-700 text-slate-200"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-[10px] text-slate-400">复活所需连续高分轮次</Label>
+                    <Input
+                      type="number"
+                      value={revivalRule.min_consecutive_high}
+                      onChange={(e) =>
+                        onRevivalRuleChange?.({
+                          ...revivalRule,
+                          min_consecutive_high: Math.max(1, Math.min(10, parseInt(e.target.value) || 1)),
+                        })
+                      }
+                      className="h-7 text-xs bg-slate-800/50 border-slate-700 text-slate-200"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-[10px] text-slate-400">每轮最大复活策略数</Label>
+                    <Input
+                      type="number"
+                      value={revivalRule.max_revival_per_round}
+                      onChange={(e) =>
+                        onRevivalRuleChange?.({
+                          ...revivalRule,
+                          max_revival_per_round: Math.max(1, Math.min(5, parseInt(e.target.value) || 1)),
+                        })
+                      }
+                      className="h-7 text-xs bg-slate-800/50 border-slate-700 text-slate-200"
+                    />
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-600">
+                  休眠策略连续 n 轮评分超过阈值后可复活
+                </p>
               </div>
 
               {/* Per Strategy Capital */}

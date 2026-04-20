@@ -125,6 +125,8 @@ services:
       - LLM_PROVIDER=ollama
       # 禁用 Ollama 请求的代理
       - OLLAMA_NO_PROXY=true
+      # CORS 配置，允许前端访问
+      - CORS_ORIGINS=http://frontend:3000,http://localhost:3002
     volumes:
       - ./backend:/app
     depends_on:

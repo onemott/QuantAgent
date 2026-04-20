@@ -204,6 +204,16 @@ class OptunaOptimizer:
             trial.set_user_attr("max_drawdown", res.get("max_drawdown", 0.0))
             trial.set_user_attr("win_rate", res.get("win_rate", 0.0))
             trial.set_user_attr("total_trades", res.get("total_trades", 0))
+            
+            # Constraint 1: Minimum trade count
+            total_trades = res.get("total_trades", 0)
+            if total_trades < 5:
+                sharpe = -999.0
+            
+            # Constraint 2: RSI parameter feasibility
+            if 'overbought' in params and 'oversold' in params:
+                if params['overbought'] - params['oversold'] < 15:
+                    sharpe = -999.0
                 
             return sharpe
 

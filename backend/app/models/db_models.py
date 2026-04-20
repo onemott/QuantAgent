@@ -637,6 +637,11 @@ class SelectionHistory(Base):
     eliminated_strategy_ids = Column(JSONB, nullable=False, default=[])
     elimination_reasons = Column(JSONB, nullable=False, default={})
     
+    # 休眠与复活详情
+    hibernating_strategy_ids = Column(JSONB, nullable=True, comment="当前处于休眠状态的策略ID列表")
+    revived_strategy_ids = Column(JSONB, nullable=True, comment="本轮被复活的策略ID列表")
+    revival_reasons = Column(JSONB, nullable=True, comment="复活原因字典")
+    
     # 权重分配
     strategy_weights = Column(JSONB, nullable=False, default={})
     

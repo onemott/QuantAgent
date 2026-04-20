@@ -432,6 +432,7 @@ class MetricsCalculator:
         drawdown_pct = (drawdown_amount / rolling_peak.replace(0.0, pd.NA)).fillna(0.0)
         max_drawdown = float(drawdown_amount.max()) if not drawdown_amount.empty else 0.0
         max_drawdown_pct = float(drawdown_pct.max()) if not drawdown_pct.empty else 0.0
+        max_drawdown_pct = min(max_drawdown_pct, 1.0)  # 最大回撤不超过 100%
 
         volatility = MetricsCalculator._annualized_volatility(returns_series, annualization_factor)
         sharpe_ratio = annualize_sharpe(returns_series, annualization_factor, risk_free_rate)
@@ -506,7 +507,22 @@ class MetricsCalculator:
             return 0.0
         if total_return_ratio <= -1.0:
             return -1.0
-        return float((1 + total_return_ratio) ** (annualization_factor / periods_observed) - 1)
+        # 短周期保护：观测期数过少时跳过年化计算，避免极端值
+        if periods_observed < 30:
+            logger.warning(
+                "Skipping annualization: periods_observed=%d < 30, returning raw return %.4f",
+                periods_observed, total_return_ratio
+            )
+            return total_return_ratio
+        # 年化因子过大保护：避免指数爆炸
+        ratio = annualization_factor / periods_observed
+        if ratio > 10:
+            logger.warning(
+                "Skipping annualization: annualization_factor/periods_observed=%.2f > 10, returning raw return %.4f",
+                ratio, total_return_ratio
+            )
+            return total_return_ratio
+        return float((1 + total_return_ratio) ** ratio - 1)
 
     @staticmethod
     def _annualized_volatility(returns: pd.Series, annualization_factor: int) -> float:

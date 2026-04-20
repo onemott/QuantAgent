@@ -10,6 +10,8 @@ import {
   Tooltip,
   Legend,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Loader2, AlertCircle, TrendingUp } from "lucide-react";
@@ -28,6 +30,10 @@ interface EliminationRecord {
   expected_volatility: number;
   expected_sharpe: number;
   created_at: string;
+  // 休眠与复活相关字段
+  hibernating_strategy_ids?: string[];
+  revived_strategy_ids?: string[];
+  revival_reasons?: Record<string, string>;
 }
 
 interface WeightEvolutionChartProps {
@@ -76,11 +82,16 @@ export function WeightEvolutionChart({
   const [records, setRecords] = useState<EliminationRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastFetchStatus, setLastFetchStatus] = useState<string>('idle');
 
   // Use external data if provided, otherwise use internal polling
   useEffect(() => {
     if (externalData !== undefined) {
       // External data provided - use it directly
+      console.log('[WeightEvolutionChart] Using external data:', {
+        recordCount: externalData.length,
+        sessionId,
+      });
       // Sort by evaluation_date ascending for proper timeline display
       const sorted = [...externalData].sort(
         (a, b) =>
@@ -90,6 +101,7 @@ export function WeightEvolutionChart({
       setRecords(sorted);
       setLoading(false);
       setError(null);
+      setLastFetchStatus(externalData.length > 0 ? 'success' : 'empty_data');
       return;
     }
 
@@ -98,12 +110,15 @@ export function WeightEvolutionChart({
 
     const fetchHistory = async (isPolling = false) => {
       if (!sessionId) {
+        console.log('[WeightEvolutionChart] No sessionId, skipping fetch');
         setLoading(false);
+        setLastFetchStatus('no_session');
         return;
       }
 
       if (!isPolling) setLoading(true);
       setError(null);
+      setLastFetchStatus('fetching');
       try {
         const res = await fetch(
           `/api/v1/dynamic-selection/history?session_id=${sessionId}&limit=100`,
@@ -113,6 +128,7 @@ export function WeightEvolutionChart({
           console.warn(`获取权重历史失败：服务器返回 ${res.status}`);
           if (!isPolling) setError(`无法加载权重历史：服务器返回 ${res.status}`);
           setRecords([]);
+          setLastFetchStatus(`error_${res.status}`);
           return;
         }
         const data: EliminationRecord[] = await res.json();
@@ -125,12 +141,15 @@ export function WeightEvolutionChart({
             )
           : [];
         setRecords(sorted);
+        setLastFetchStatus(sorted.length > 0 ? 'success' : 'empty_data');
+        console.log('[WeightEvolutionChart] Fetched records:', sorted.length);
       } catch (err: any) {
         // Ignore abort errors
         if (err.name === 'AbortError') return;
         console.warn("获取权重历史失败:", err);
         if (!isPolling) setError("后端服务未连接，无法加载权重历史");
         setRecords([]);
+        setLastFetchStatus('error_network');
       } finally {
         setLoading(false);
       }
@@ -158,13 +177,55 @@ export function WeightEvolutionChart({
     return Array.from(ids);
   }, [records]);
 
+  // Compute hibernating status per strategy per time point
+  // Returns: Map<strategyId, Set<timeIndex>> - the time indices where the strategy is hibernating
+  const hibernatingStatus = useMemo(() => {
+    const status = new Map<string, Set<number>>();
+    strategyIds.forEach(id => status.set(id, new Set()));
+    
+    records.forEach((record, index) => {
+      const hibernatingIds = record.hibernating_strategy_ids ?? [];
+      hibernatingIds.forEach(id => {
+        if (status.has(id)) {
+          status.get(id)!.add(index);
+        }
+      });
+    });
+    return status;
+  }, [records, strategyIds]);
+
+  // Compute revival events: Map<strategyId, Array<{index: number, reason: string}>>
+  const revivalEvents = useMemo(() => {
+    const events = new Map<string, Array<{index: number; reason: string}>>();
+    
+    records.forEach((record, index) => {
+      const revivedIds = record.revived_strategy_ids ?? [];
+      const reasons = record.revival_reasons ?? {};
+      revivedIds.forEach(id => {
+        if (!events.has(id)) {
+          events.set(id, []);
+        }
+        events.get(id)!.push({
+          index,
+          reason: reasons[id] || '复活'
+        });
+      });
+    });
+    return events;
+  }, [records]);
+
   // Transform data for Recharts: each record becomes a data point
   // with weights for each strategy
   const chartData = useMemo(() => {
     return records.map((record, index) => {
-      const point: Record<string, number | string> = {
+      const point: Record<string, number | string | Record<string, string>[]> = {
         time: formatXAxisDate(record.evaluation_date),
         evaluationIndex: index + 1,
+        // Store revival events for this time point
+        _revivals: (record.revived_strategy_ids ?? []).map(id => ({
+          strategyId: id,
+          reason: record.revival_reasons?.[id] || ''
+        }))
       };
       // Add weight for each strategy with clamp validation
       Object.entries(record.strategy_weights ?? {}).forEach(
@@ -214,10 +275,19 @@ export function WeightEvolutionChart({
         ) : !hasData ? (
           <div className="flex flex-col items-center justify-center py-12 text-slate-500">
             <TrendingUp className="w-8 h-8 mb-2 opacity-50" />
-            <span className="text-sm">暂无权重变化数据</span>
-            <span className="text-xs text-slate-600 mt-1">
-              dynamic_selection 策略运行后将显示权重变化
+            <span className="text-sm">
+              {isRunning ? '等待评估数据...' : '暂无权重变化数据'}
             </span>
+            <div className="text-xs text-slate-600 mt-2 space-y-1">
+              <div>Session ID: {sessionId || '未获取'}</div>
+              <div>请求状态: {lastFetchStatus}</div>
+              <div>数据条数: {records.length}</div>
+              {isRunning && (
+                <div className="text-emerald-400 mt-2">
+                  策略运行中，等待第一个评估周期完成...
+                </div>
+              )}
+            </div>
           </div>
         ) : (
           <div className="w-full" style={{ height: "280px" }}>
@@ -268,19 +338,48 @@ export function WeightEvolutionChart({
                   iconType="line"
                   iconSize={10}
                 />
-                {strategyIds.map((strategyId, index) => (
-                  <Line
-                    key={strategyId}
-                    type="monotone"
-                    dataKey={strategyId}
-                    stroke={STRATEGY_COLORS[index % STRATEGY_COLORS.length]}
-                    strokeWidth={2}
-                    dot={false}
-                    activeDot={{ r: 4 }}
-                    connectNulls
-                  />
-                ))}
-              </LineChart>
+                {strategyIds.map((strategyId, index) => {
+                  const hibernatingIndices = hibernatingStatus.get(strategyId) || new Set<number>();
+                  const isHibernating = hibernatingIndices.size > 0;
+                  const color = STRATEGY_COLORS[index % STRATEGY_COLORS.length];
+                  
+                  return (
+                    <Line
+                      key={strategyId}
+                      type="monotone"
+                      dataKey={strategyId}
+                      stroke={color}
+                      strokeWidth={2}
+                      strokeDasharray={isHibernating ? "5 5" : undefined}
+                      strokeOpacity={isHibernating ? 0.4 : 1}
+                      dot={false}
+                      activeDot={{ r: 4 }}
+                      connectNulls
+                    />
+                  );
+                })}
+                {/* Revival events marker */}
+                {strategyIds.map((strategyId, index) => {
+                  const events = revivalEvents.get(strategyId) || [];
+                  if (events.length === 0) return null;
+                  
+                  const revivalData = events.map(e => ({
+                    time: chartData[e.index]?.time,
+                    [strategyId]: chartData[e.index]?.[strategyId],
+                    reason: e.reason
+                  }));
+                  
+                  return (
+                    <Scatter
+                      key={`revival-${strategyId}`}
+                      data={revivalData}
+                      dataKey={strategyId}
+                      fill="#22c55e"
+                      shape="circle"
+                      r={6}
+                    />
+                  );
+                })}              </LineChart>
             </ResponsiveContainer>
           </div>
         )}

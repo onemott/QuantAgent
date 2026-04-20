@@ -71,7 +71,10 @@ coverage.out
 # ── Local smoke tests (keep real tests under tests/ or backend/tests/) ──────────
 /test_*.py
 backend/test_*.py
+
+# 保留 backend/scripts/ 下的测试脚本排除
 backend/scripts/test_*.py
+backend/scripts/verify_*.py
 scripts/test_*.py
 
 verify_*.py
@@ -115,3 +118,15 @@ backend/test_output*.txt
 # ── Personal notes & checklists ──
 焚诀.md
 WFA功能问题清单.txt
+
+# ── Backend local docs (design documents, not pushed to GitHub) ──
+backend/docs/
+
+# ── Backend scripts exclusions | 后端脚本排除规则 ──
+# 排除测试和验证脚本 (保留 run_migrations.py, generate_mock_user_data.py 等核心脚本)
+backend/scripts/output/
+backend/scripts/*.csv
+backend/scripts/wfa_*.csv
+
+# ── Root-level debug scripts ──
+/debug_*.py

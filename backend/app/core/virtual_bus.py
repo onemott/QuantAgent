@@ -76,6 +76,7 @@ class VirtualExecutionRouter(ExecutionRouter):
         self.equity_curve: List[Tuple[datetime, float]] = []
         self.trade_count = 0
         self.winning_trades = 0
+        self.trade_log: List[Dict[str, Any]] = []
         self.current_bar: Optional[BarData] = None
         self._last_snapshot_time: Optional[datetime] = None
 
@@ -141,6 +142,14 @@ class VirtualExecutionRouter(ExecutionRouter):
                 self.position_avg_price = 0.0
                 
         self.trade_count += 1
+        self.trade_log.append(
+            {
+                "timestamp": self.current_bar.datetime,
+                "side": order_req.side.value,
+                "pnl": pnl,
+                "quantity": order_req.quantity,
+            }
+        )
         
         # Record equity after trade (can overwrite same timestamp or append)
         self.equity_curve.append((self.current_bar.datetime, self.get_equity()))
@@ -159,31 +168,39 @@ class VirtualExecutionRouter(ExecutionRouter):
             timestamp=self.current_bar.datetime,
         )
 
-    def get_performance_metric(self) -> VirtualPerformanceMetric:
+    def _build_performance_metric(
+        self,
+        equity_points: List[Tuple[datetime, float]],
+        initial_capital: float,
+        total_trades: int,
+        winning_trades: int,
+    ) -> VirtualPerformanceMetric:
         metric = VirtualPerformanceMetric()
-        metric._total_trades = self.trade_count
-        if self.trade_count > 0:
-            metric._win_rate = self.winning_trades / self.trade_count
+        metric._total_trades = total_trades
+        if total_trades > 0:
+            metric._win_rate = winning_trades / total_trades
             
-        if not self.equity_curve:
+        if not equity_points:
             return metric
             
-        df = pd.DataFrame(self.equity_curve, columns=["datetime", "equity"])
+        df = pd.DataFrame(equity_points, columns=["datetime", "equity"])
         df.set_index("datetime", inplace=True)
         # Keep last record for each timestamp
         df = df[~df.index.duplicated(keep='last')]
         df.sort_index(inplace=True)
         
         if len(df) < 2:
-            total_return = (self.get_equity() - self.initial_capital) / self.initial_capital
+            starting_equity = float(initial_capital or 0.0)
+            ending_equity = float(df["equity"].iloc[-1])
+            total_return = ((ending_equity - starting_equity) / starting_equity) if starting_equity > 0 else 0.0
             metric._total_return = float(total_return)
             return metric
             
         standardized = MetricsCalculator.calculate_from_equity_points(
-            equity_points=self.equity_curve,
-            initial_capital=self.initial_capital,
-            total_trades=self.trade_count,
-            winning_trades=self.winning_trades,
+            equity_points=equity_points,
+            initial_capital=initial_capital,
+            total_trades=total_trades,
+            winning_trades=winning_trades,
         )
         metric._total_return = standardized.total_return
         metric._annualized_return = standardized.annualized_return
@@ -196,10 +213,54 @@ class VirtualExecutionRouter(ExecutionRouter):
 
         return metric
 
+    def get_performance_metric(self) -> VirtualPerformanceMetric:
+        return self._build_performance_metric(
+            equity_points=self.equity_curve,
+            initial_capital=self.initial_capital,
+            total_trades=self.trade_count,
+            winning_trades=self.winning_trades,
+        )
+
+    def get_performance_metric_in_window(
+        self,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> VirtualPerformanceMetric:
+        if window_end < window_start:
+            raise ValueError("window_end must be greater than or equal to window_start")
+        if not self.equity_curve:
+            return VirtualPerformanceMetric()
+
+        equity_frame = pd.DataFrame(self.equity_curve, columns=["datetime", "equity"])
+        equity_frame["datetime"] = pd.to_datetime(equity_frame["datetime"], utc=True)
+        equity_frame = equity_frame.drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime")
+        mask = (equity_frame["datetime"] >= window_start) & (equity_frame["datetime"] <= window_end)
+        window_frame = equity_frame.loc[mask]
+        if window_frame.empty:
+            return VirtualPerformanceMetric()
+
+        window_points = list(window_frame.itertuples(index=False, name=None))
+        initial_capital = float(window_frame.iloc[0]["equity"])
+        window_trades = [
+            trade
+            for trade in self.trade_log
+            if window_start <= trade["timestamp"] <= window_end
+        ]
+        total_trades = len(window_trades)
+        winning_trades = sum(1 for trade in window_trades if float(trade.get("pnl", 0.0)) > 0)
+
+        return self._build_performance_metric(
+            equity_points=window_points,
+            initial_capital=initial_capital,
+            total_trades=total_trades,
+            winning_trades=winning_trades,
+        )
+
 
 class VirtualTradingBus(TradingBus):
-    def __init__(self, initial_capital: float = 10000.0):
+    def __init__(self, initial_capital: float = 10000.0, session_id: Optional[str] = None):
         self.router = VirtualExecutionRouter(initial_capital=initial_capital)
+        self.session_id = session_id  # 添加 session_id 属性，保持与其他 Bus 实现的一致性
 
     async def execute_order(self, order_req: OrderRequest) -> OrderResult:
         return await self.router.execute(order_req, mode="virtual")
@@ -246,4 +307,11 @@ class VirtualTradingBus(TradingBus):
 
     def get_performance_metric(self) -> VirtualPerformanceMetric:
         return self.router.get_performance_metric()
+
+    def get_performance_metric_in_window(
+        self,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> VirtualPerformanceMetric:
+        return self.router.get_performance_metric_in_window(window_start, window_end)
 

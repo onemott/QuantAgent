@@ -19,6 +19,10 @@ interface EliminationRecord {
   expected_volatility: number;
   expected_sharpe: number;
   created_at: string;
+  // 休眠与复活相关字段
+  hibernating_strategy_ids?: string[];
+  revived_strategy_ids?: string[];
+  revival_reasons?: Record<string, string>;
 }
 
 interface EliminationHistoryProps {
@@ -60,14 +64,21 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
   const [records, setRecords] = useState<EliminationRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastFetchStatus, setLastFetchStatus] = useState<string>('idle');
 
   // Use external data if provided, otherwise use internal polling
   useEffect(() => {
     if (data !== undefined) {
       // External data provided - use it directly (take first 20 for display)
+      console.log('[EliminationHistory] Using external data:', {
+        recordCount: data.length,
+        sessionId,
+        isRunning,
+      });
       setRecords(data.slice(0, 20));
       setLoading(false);
       setError(null);
+      setLastFetchStatus(data.length > 0 ? 'success' : 'empty_data');
       return;
     }
 
@@ -81,6 +92,14 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
         setLoading(true);
       }
       setError(null);
+      setLastFetchStatus('fetching');
+      
+      console.log('[EliminationHistory] Fetching history:', {
+        isPolling,
+        sessionId,
+        isRunning,
+      });
+      
       try {
         // Build URL with optional session_id filter
         const params = new URLSearchParams({ limit: "20" });
@@ -95,6 +114,7 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
           console.warn(`获取历史记录失败：服务器返回 ${res.status}`);
           if (!isPolling) setError(`无法加载历史记录：服务器返回 ${res.status}`);
           setRecords([]);
+          setLastFetchStatus(`error_${res.status}`);
           return;
         }
         const data = await res.json();
@@ -102,15 +122,19 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
         if (!Array.isArray(data)) {
           console.warn("EliminationHistory: API返回非数组类型", typeof data);
           setRecords([]);
+          setLastFetchStatus('error_invalid_type');
           return;
         }
+        console.log('[EliminationHistory] Fetched records:', data.length);
         setRecords(data);
+        setLastFetchStatus(data.length > 0 ? 'success' : 'empty_data');
       } catch (err: any) {
         // Ignore abort errors
         if (err.name === 'AbortError') return;
         console.warn("获取历史记录失败:", err);
         if (!isPolling) setError("后端服务未连接，无法加载历史记录");
         setRecords([]);
+        setLastFetchStatus('error_network');
       } finally {
         setLoading(false);
       }
@@ -151,7 +175,18 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
         ) : records.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 text-slate-500">
             <History className="w-8 h-8 mb-2 opacity-50" />
-            <span className="text-sm">暂无淘汰记录</span>
+            <span className="text-sm">
+              {isRunning ? '等待淘汰记录...' : '暂无淘汰记录'}
+            </span>
+            <div className="text-xs text-slate-600 mt-2 space-y-1">
+              <div>Session ID: {sessionId || '未获取'}</div>
+              <div>请求状态: {lastFetchStatus}</div>
+              {isRunning && (
+                <div className="text-emerald-400 mt-2">
+                  策略运行中，等待第一个评估周期完成...
+                </div>
+              )}
+            </div>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -166,6 +201,12 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
                   </th>
                   <th className="text-center py-3 px-4 text-slate-400 font-medium text-xs">
                     淘汰数
+                  </th>
+                  <th className="text-center py-3 px-4 text-slate-400 font-medium text-xs">
+                    休眠中
+                  </th>
+                  <th className="text-center py-3 px-4 text-slate-400 font-medium text-xs">
+                    复活
                   </th>
                   <th className="text-center py-3 px-4 text-slate-400 font-medium text-xs">
                     存活数
@@ -203,6 +244,16 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
                       </span>
                     </td>
                     <td className="py-3 px-4 text-center">
+                      <span className="text-amber-400 font-mono font-medium">
+                        {record.hibernating_strategy_ids?.length ?? 0}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-center">
+                      <span className="text-green-400 font-mono font-medium">
+                        {record.revived_strategy_ids?.length ?? 0}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-center">
                       <span className="text-emerald-400 font-mono font-medium">
                         {record.surviving_count}
                       </span>
@@ -214,7 +265,7 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
                             <Badge
                               key={strategyId}
                               variant="outline"
-                              className="bg-red-500/10 text-red-400 border-red-500/20 text-xs"
+                              className="bg-amber-500/10 text-amber-400 border-amber-500/20 text-xs"
                             >
                               {strategyId}
                             </Badge>
@@ -223,6 +274,21 @@ export function EliminationHistory({ className, sessionId, isRunning, data }: El
                           <span className="text-slate-500 text-xs">-</span>
                         )}
                       </div>
+                      {/* 复活策略 */}
+                      {record.revived_strategy_ids && record.revived_strategy_ids.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {record.revived_strategy_ids.map((strategyId) => (
+                            <Badge
+                              key={`revived-${strategyId}`}
+                              variant="outline"
+                              className="bg-green-500/10 text-green-400 border-green-500/20 text-xs"
+                              title={record.revival_reasons?.[strategyId] || ''}
+                            >
+                              🔄 {strategyId}
+                            </Badge>
+                          ))}
+                        </div>
+                      )}
                     </td>
                     <td className="py-3 px-4">
                       <div className="flex flex-wrap gap-1">

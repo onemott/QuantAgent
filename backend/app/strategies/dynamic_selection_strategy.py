@@ -9,7 +9,7 @@ from app.models.db_models import SelectionHistory
 
 from app.services.dynamic_selection.evaluator import StrategyEvaluator
 from app.services.dynamic_selection.ranker import StrategyRanker
-from app.services.dynamic_selection.eliminator import StrategyEliminator, EliminationRule
+from app.services.dynamic_selection.eliminator import StrategyEliminator, EliminationRule, RevivalRule
 from app.services.dynamic_selection.weight_allocator import WeightAllocator
 from app.strategies.composition.weighted import WeightedComposer
 from app.services.database import get_session_factory
@@ -34,8 +34,14 @@ class DynamicSelectionStrategy(BaseStrategy):
         
         self.alive_strategies: Dict[str, BaseStrategy] = {}
         self.virtual_buses: Dict[str, VirtualTradingBus] = {}
-        
+
         self.consecutive_low_counts: Dict[str, int] = {}
+
+        # 休眠策略状态管理
+        self.hibernating_strategies: Dict[str, Any] = {}  # 休眠策略集合
+        self.hibernating_buses: Dict[str, Any] = {}  # 休眠策略的虚拟总线
+        self.consecutive_high_counts: Dict[str, int] = {}  # 休眠策略连续高分计数
+
         self.last_evaluation_bar_index = 0
         self._last_evaluation_datetime: datetime = None  # 记录上次评估时间
         self.current_position = 0.0
@@ -50,12 +56,26 @@ class DynamicSelectionStrategy(BaseStrategy):
         self.evaluation_period = 1440
         self.weight_method = "score_based"
         self.elimination_rule = EliminationRule()
+        self.revival_rule = RevivalRule()
+        
+        # 缓存 session_id，避免每次评估时重新获取
+        self._cached_session_id: str = None
+        self._session_id_logged = False  # 避免重复日志
+        self._initial_evaluation_done = False  # 追踪是否已完成初始评估
 
     def set_parameters(self, params: Dict[str, Any]):
         """
         Initialize the dynamic selection strategy parameters and atomic strategies.
         """
         super().set_parameters(params)
+        
+        # 缓存 session_id 并记录日志
+        self._cached_session_id = getattr(self.bus, "session_id", None)
+        if self._cached_session_id:
+            logger.info(f"[{self.strategy_id}] Session ID cached: {self._cached_session_id}")
+        else:
+            logger.warning(f"[{self.strategy_id}] session_id is None! SelectionHistory records will have NULL session_id. "
+                           f"Bus type: {type(self.bus).__name__}. Check if bus.session_id is properly initialized.")
         
         atomic_strategies = params.get("atomic_strategies", [])
         if not atomic_strategies:
@@ -120,8 +140,17 @@ class DynamicSelectionStrategy(BaseStrategy):
         initial_weights = {s_id: 1.0 / alive_count for s_id in self.alive_strategies.keys()}
         self.composer = WeightedComposer(composition_id="dynamic_weighted", weights=initial_weights, threshold=threshold)
         
-        rule_params = params.get("elimination_rule", {})
-        self.elimination_rule = EliminationRule(**rule_params)
+        elimination_rule_params = params.get("elimination_rule", {})
+        if elimination_rule_params:
+            self.elimination_rule = EliminationRule(**elimination_rule_params)
+        
+        revival_rule_params = params.get("revival_rule", {})
+        if revival_rule_params:
+            self.revival_rule = RevivalRule(
+                revival_score_threshold=float(revival_rule_params.get("revival_score_threshold", 45.0)),
+                min_consecutive_high=int(revival_rule_params.get("min_consecutive_high", 2)),
+                max_revival_per_round=int(revival_rule_params.get("max_revival_per_round", 2))
+            )
         
         self.evaluation_period = params.get("evaluation_period", 1440)
         self.weight_method = params.get("weight_method", "score_based")
@@ -137,18 +166,47 @@ class DynamicSelectionStrategy(BaseStrategy):
             vbus = self.virtual_buses[s_id]
             await vbus.publish_bar(bar)
             await strategy.on_bar(bar)
-            
-        # 2. Check if we need to evaluate and eliminate
+        
+        # 休眠策略也继续接收K线数据进行虚拟交易（不产生实际信号）
+        for strategy_id, strategy in self.hibernating_strategies.items():
+            try:
+                bus = self.hibernating_buses.get(strategy_id)
+                if bus:
+                    await bus.publish_bar(bar)
+                    await strategy.on_bar(bar)
+            except Exception as e:
+                logger.warning(f"Hibernating strategy {strategy_id} on_bar error: {e}")
+        
+        # 2. 初始评估：确保短期回放也能触发至少一次评估
+        #    当达到 evaluation_period 的 10% 时触发初始评估（最少 10 根 K 线）
+        if not self._initial_evaluation_done:
+            initial_trigger_threshold = max(10, int(self.evaluation_period * 0.1))
+            if self.bar_count >= initial_trigger_threshold:
+                logger.info(f"[{self.strategy_id}] Triggering initial evaluation at bar {self.bar_count} "
+                            f"(threshold: {initial_trigger_threshold}, evaluation_period: {self.evaluation_period})")
+                await self._run_evaluation(bar, is_initial=True)
+                self._initial_evaluation_done = True
+        
+        # 3. 定期评估
         if self.bar_count - self.last_evaluation_bar_index >= self.evaluation_period:
             await self._run_evaluation(bar)
             
-        # 3. Compose signal and execute
+        # 4. Compose signal and execute
         signal = self._compose_signal()
         await self._execute_signal(signal, bar)
         
-    async def _run_evaluation(self, bar: BarData):
+    async def _run_evaluation(self, bar: BarData, is_initial: bool = False):
         if not self.alive_strategies:
             return
+        
+        # 初始化复活相关变量（即使没有休眠策略也要定义）
+        revived_ids = []
+        revival_reasons = {}
+        
+        eval_type = "initial" if is_initial else "periodic"
+        logger.info(f"[{self.strategy_id}] Running {eval_type} evaluation at {bar.datetime}, "
+                    f"bar_count={self.bar_count}, alive_strategies={len(self.alive_strategies)}, "
+                    f"session_id={self._cached_session_id}")
             
         # 计算评估窗口：从上次评估时间到当前时间
         window_start = self._last_evaluation_datetime if self._last_evaluation_datetime else bar.datetime
@@ -182,34 +240,84 @@ class DynamicSelectionStrategy(BaseStrategy):
                 
         eliminated_ids = [rs.strategy_id for rs in eliminated]
         for e_id in eliminated_ids:
+            # 移入休眠而非删除
             if e_id in self.alive_strategies:
-                del self.alive_strategies[e_id]
+                self.hibernating_strategies[e_id] = self.alive_strategies.pop(e_id)
             if e_id in self.virtual_buses:
-                del self.virtual_buses[e_id]
-            if e_id in self.consecutive_low_counts:
-                del self.consecutive_low_counts[e_id]
+                self.hibernating_buses[e_id] = self.virtual_buses.pop(e_id)
+            # 保留 consecutive_low_counts 记录，初始化连续高分计数
+            self.consecutive_high_counts[e_id] = 0
+        
+        # === 休眠策略虚拟评估与复活检查 ===
+        if self.hibernating_strategies:
+            # 对休眠策略进行虚拟评估
+            hibernating_scores = {}
+            for h_id in list(self.hibernating_strategies.keys()):
+                try:
+                    h_bus = self.hibernating_buses.get(h_id)
+                    if h_bus:
+                        h_perf = h_bus.get_performance_metric()
+                        h_eval = self.evaluator.evaluate(
+                            strategy_id=h_id,
+                            performance=h_perf,
+                            window_start=window_start,
+                            window_end=window_end,
+                            evaluation_date=bar.datetime
+                        )
+                        hibernating_scores[h_id] = h_eval.total_score
+                except Exception as e:
+                    logger.warning(f"Hibernating strategy {h_id} evaluation error: {e}")
+            
+            # 检查复活条件
+            if hibernating_scores:
+                revived_ids, self.consecutive_high_counts, revival_reasons = (
+                    StrategyEliminator.check_revival(
+                        hibernating_scores=hibernating_scores,
+                        consecutive_high_counts=self.consecutive_high_counts,
+                        rule=self.revival_rule
+                    )
+                )
+                
+                # 执行复活：从休眠集合移回活跃集合
+                for r_id in revived_ids:
+                    if r_id in self.hibernating_strategies:
+                        self.alive_strategies[r_id] = self.hibernating_strategies.pop(r_id)
+                    if r_id in self.hibernating_buses:
+                        self.virtual_buses[r_id] = self.hibernating_buses.pop(r_id)
+                    # 重置连续低分计数
+                    self.consecutive_low_counts[r_id] = 0
+                    # 清除连续高分计数
+                    if r_id in self.consecutive_high_counts:
+                        del self.consecutive_high_counts[r_id]
+                    logger.info(f"Strategy {r_id} revived: {revival_reasons.get(r_id, 'unknown')}")
                 
         new_weights = self.weight_allocator.allocate_weights(surviving, method=self.weight_method)
         self.composer.update_weights(new_weights)
         
-        # Save to DB
-        session_id = getattr(self.bus, "session_id", None)
+        # Save to DB - 使用缓存的 session_id
         history = SelectionHistory(
-            session_id=session_id,
+            session_id=self._cached_session_id,
             evaluation_date=bar.datetime,
             total_strategies=len(ranked_strategies),
             surviving_count=len(surviving),
             eliminated_count=len(eliminated),
             eliminated_strategy_ids=eliminated_ids,
             elimination_reasons=reasons,
-            strategy_weights=new_weights
+            strategy_weights=new_weights,
+            hibernating_strategy_ids=list(self.hibernating_strategies.keys()),
+            revived_strategy_ids=revived_ids,
+            revival_reasons=revival_reasons
         )
+        
+        logger.info(f"[{self.strategy_id}] Evaluation complete: surviving={len(surviving)}, "
+                    f"eliminated={len(eliminated)}, session_id={self._cached_session_id}")
         
         factory = get_session_factory()
         try:
             async with factory() as db_session:
                 db_session.add(history)
                 await db_session.commit()
+                logger.debug(f"[{self.strategy_id}] SelectionHistory saved with session_id={self._cached_session_id}")
         except Exception as e:
             logger.error(f"[{self.strategy_id}] Failed to save SelectionHistory: {e}")
         

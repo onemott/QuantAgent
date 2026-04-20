@@ -126,6 +126,25 @@ class DynamicSelectionConfig(BaseModel):
         }, 
         description="评估指标权重"
     )
+    # 复活规则参数
+    revival_score_threshold: float = Field(
+        default=45.0,
+        ge=0.0,
+        le=100.0,
+        description="复活评分阈值: 休眠策略评分高于此阈值可考虑复活"
+    )
+    min_consecutive_high: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="连续高于阈值的轮次数: 休眠策略需连续高于阈值多少轮才能复活"
+    )
+    max_revival_per_round: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="每轮最多复活策略数"
+    )
     
     @field_validator('metrics_weights')
     @classmethod
@@ -169,12 +188,33 @@ class AllocationResponse(BaseModel):
 class AllocationUpdateRequest(BaseModel):
     strategy_weights: Dict[str, float]
 
+class SelectionHistoryResponse(BaseModel):
+    """Response model for selection history endpoint"""
+    id: int
+    session_id: Optional[str] = None
+    evaluation_date: datetime
+    total_strategies: int = 0
+    surviving_count: int = 0
+    eliminated_count: int = 0
+    eliminated_strategy_ids: List[str] = []
+    elimination_reasons: Dict[str, str] = {}
+    strategy_weights: Dict[str, float] = {}
+    expected_return: Optional[float] = None
+    expected_volatility: Optional[float] = None
+    expected_sharpe: Optional[float] = None
+    # 休眠与复活相关字段
+    hibernating_strategy_ids: Optional[List[str]] = None
+    revived_strategy_ids: Optional[List[str]] = None
+    revival_reasons: Optional[Dict[str, str]] = None
+    created_at: Optional[datetime] = None
+
 class StatusResponse(BaseModel):
     """Response model for the status endpoint - matches frontend MonitorData interface"""
     dimensions: List[Dict[str, Any]] = Field(default=[], description="策略维度评分数据")
     weights: List[Dict[str, Any]] = Field(default=[], description="策略权重分配数据")
     lastUpdated: str = Field(default="", description="最后评估时间（ISO字符串）")
     activeCount: int = Field(default=0, description="当前活跃策略数量")
+    hibernatingCount: int = Field(default=0, description="当前休眠策略数量")
     totalAllocation: int = Field(default=100000, description="总分配资金（USDT）")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -532,7 +572,7 @@ async def trigger_evaluation(
             detail=f"Evaluation process failed: {str(e)}"
         )
 
-@router.get("/history")
+@router.get("/history", response_model=List[SelectionHistoryResponse])
 async def get_selection_history(
     limit: int = Query(10, ge=1, le=100),
     session_id: Optional[str] = Query(None, description="按回放会话ID过滤"),
@@ -540,16 +580,53 @@ async def get_selection_history(
 ):
     """
     Get the history of strategy selections and eliminations.
+    返回策略选择和淘汰的历史记录。
     """
-    stmt = select(SelectionHistory)
-    if session_id:
-        stmt = stmt.where(SelectionHistory.session_id == session_id)
-    stmt = stmt.order_by(desc(SelectionHistory.evaluation_date)).limit(limit)
-    
-    result = await db.execute(stmt)
-    history = result.scalars().all()
-    
-    return history
+    try:
+        stmt = select(SelectionHistory)
+        if session_id:
+            stmt = stmt.where(SelectionHistory.session_id == session_id)
+        stmt = stmt.order_by(desc(SelectionHistory.evaluation_date)).limit(limit)
+        
+        result = await db.execute(stmt)
+        history_records = result.scalars().all()
+        
+        # 如果没有数据，返回空数组
+        if not history_records:
+            return []
+        
+        # 转换 ORM 对象为响应模型，处理可能的 NULL 值
+        response = []
+        for record in history_records:
+            response.append(SelectionHistoryResponse(
+                id=record.id,
+                session_id=record.session_id,
+                evaluation_date=record.evaluation_date,
+                total_strategies=record.total_strategies or 0,
+                surviving_count=record.surviving_count or 0,
+                eliminated_count=record.eliminated_count or 0,
+                eliminated_strategy_ids=record.eliminated_strategy_ids or [],
+                elimination_reasons=record.elimination_reasons or {},
+                strategy_weights=record.strategy_weights or {},
+                expected_return=record.expected_return,
+                expected_volatility=record.expected_volatility,
+                expected_sharpe=record.expected_sharpe,
+                # 休眠与复活相关字段
+                hibernating_strategy_ids=record.hibernating_strategy_ids,
+                revived_strategy_ids=record.revived_strategy_ids,
+                revival_reasons=record.revival_reasons,
+                created_at=record.created_at,
+            ))
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching selection history: {e}", exc_info=True)
+        # 返回有意义的错误信息而非裸 500
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch selection history: {str(e)}"
+        )
 
 @router.get("/metrics/radar", response_model=RadarMetricsResponse)
 async def get_radar_metrics(
@@ -559,54 +636,73 @@ async def get_radar_metrics(
     """
     Get radar chart metrics for a specific strategy based on its latest evaluation.
     """
-    stmt = (
-        select(StrategyEvaluation)
-        .where(StrategyEvaluation.strategy_id == strategy_id)
-        .order_by(desc(StrategyEvaluation.evaluation_date))
-        .limit(1)
-    )
-    result = await db.execute(stmt)
-    eval_record = result.scalars().first()
-    
-    if not eval_record:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"No evaluation record found for strategy {strategy_id}"
+    try:
+        stmt = (
+            select(StrategyEvaluation)
+            .where(StrategyEvaluation.strategy_id == strategy_id)
+            .order_by(desc(StrategyEvaluation.evaluation_date))
+            .limit(1)
+        )
+        result = await db.execute(stmt)
+        eval_record = result.scalars().first()
+        
+        if not eval_record:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No evaluation record found for strategy {strategy_id}"
+            )
+        
+        metrics = StrategyMetrics(
+            return_score=eval_record.return_score or 0.0,
+            risk_score=eval_record.risk_score or 0.0,
+            stability_score=eval_record.stability_score or 0.0,
+            efficiency_score=eval_record.efficiency_score or 0.0,
+            total_score=eval_record.total_score or 0.0
         )
         
-    metrics = StrategyMetrics(
-        return_score=eval_record.return_score or 0.0,
-        risk_score=eval_record.risk_score or 0.0,
-        stability_score=eval_record.stability_score or 0.0,
-        efficiency_score=eval_record.efficiency_score or 0.0,
-        total_score=eval_record.total_score or 0.0
-    )
+        return RadarMetricsResponse(
+            strategy_id=eval_record.strategy_id,
+            evaluation_date=eval_record.evaluation_date,
+            metrics=metrics
+        )
     
-    return RadarMetricsResponse(
-        strategy_id=eval_record.strategy_id,
-        evaluation_date=eval_record.evaluation_date,
-        metrics=metrics
-    )
+    except HTTPException:
+        raise  # 重新抛出 HTTPException（如 404）
+    except Exception as e:
+        logger.error(f"Error fetching radar metrics for {strategy_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch radar metrics: {str(e)}"
+        )
 
 @router.get("/allocation", response_model=AllocationResponse)
 async def get_allocation(db: AsyncSession = Depends(get_db_session)):
     """
     Get the current capital allocation weights for active strategies.
     """
-    stmt = select(SelectionHistory).order_by(desc(SelectionHistory.evaluation_date)).limit(1)
-    result = await db.execute(stmt)
-    latest_history = result.scalars().first()
+    try:
+        stmt = select(SelectionHistory).order_by(desc(SelectionHistory.evaluation_date)).limit(1)
+        result = await db.execute(stmt)
+        latest_history = result.scalars().first()
+        
+        if not latest_history:
+            return AllocationResponse(
+                evaluation_date=datetime.now(timezone.utc),
+                strategy_weights={}
+            )
+        
+        return AllocationResponse(
+            evaluation_date=latest_history.evaluation_date,
+            strategy_weights=latest_history.strategy_weights or {}
+        )
     
-    if not latest_history:
+    except Exception as e:
+        logger.error(f"Error fetching allocation: {e}", exc_info=True)
+        # 返回默认值而非报错
         return AllocationResponse(
             evaluation_date=datetime.now(timezone.utc),
             strategy_weights={}
         )
-        
-    return AllocationResponse(
-        evaluation_date=latest_history.evaluation_date,
-        strategy_weights=latest_history.strategy_weights
-    )
 
 @router.post("/allocation")
 async def manual_update_allocation(
@@ -626,7 +722,10 @@ async def manual_update_allocation(
 
 
 @router.get("/status", response_model=StatusResponse)
-async def get_status(db: AsyncSession = Depends(get_db_session)):
+async def get_status(
+    session_id: Optional[str] = Query(None, description="按回放会话ID过滤"),
+    db: AsyncSession = Depends(get_db_session)
+):
     """
     Get aggregated status data for the strategy monitor dashboard.
     Returns dimension scores, weights allocation, and summary statistics.
@@ -639,13 +738,20 @@ async def get_status(db: AsyncSession = Depends(get_db_session)):
     try:
         dimensions = []
         active_count = 0
+        hibernating_count = 0
         weights = []
         total_allocation = 100000  # 默认总资金
         latest_date = None
         
         # 步骤1：先从 SelectionHistory 获取最新记录（包含 evaluation_date 和 strategy_weights）
         # 这确保了数据来源的一致性
-        stmt_history = select(SelectionHistory).order_by(
+        stmt_history = select(SelectionHistory)
+        
+        # 如果指定了 session_id，添加过滤条件
+        if session_id:
+            stmt_history = stmt_history.where(SelectionHistory.session_id == session_id)
+        
+        stmt_history = stmt_history.order_by(
             desc(SelectionHistory.evaluation_date)
         ).limit(1)
         result_history = await db.execute(stmt_history)
@@ -654,6 +760,10 @@ async def get_status(db: AsyncSession = Depends(get_db_session)):
         if latest_history:
             # 使用 SelectionHistory 的 evaluation_date 作为统一的时间基准
             latest_date = latest_history.evaluation_date
+            
+            # 计算休眠策略数量
+            if latest_history.hibernating_strategy_ids:
+                hibernating_count = len(latest_history.hibernating_strategy_ids)
             
             # 步骤2：用同一个 evaluation_date 查询 StrategyEvaluation 表的 dimensions
             stmt_evaluations = select(StrategyEvaluation).where(
@@ -695,23 +805,25 @@ async def get_status(db: AsyncSession = Depends(get_db_session)):
                         "fill": _get_strategy_color(idx)
                     })
         
-        # 如果没有数据，返回默认空结构
+        # 如果没有数据，返回合理的默认结构（与前端 MOCK_DATA 格式一致）
+        # 当无评估数据时，使用均等分配作为初始状态
         if not dimensions:
             dimensions = [
-                {"subject": "动量 (Momentum)", "score": 0, "fullMark": 100},
-                {"subject": "均值回归 (Reversion)", "score": 0, "fullMark": 100},
-                {"subject": "波动率 (Volatility)", "score": 0, "fullMark": 100},
-                {"subject": "成交量 (Volume)", "score": 0, "fullMark": 100},
-                {"subject": "市场情绪 (Sentiment)", "score": 0, "fullMark": 100},
+                {"subject": "动量 (Momentum)", "score": 50, "fullMark": 100},
+                {"subject": "均值回归 (Reversion)", "score": 50, "fullMark": 100},
+                {"subject": "波动率 (Volatility)", "score": 50, "fullMark": 100},
+                {"subject": "成交量 (Volume)", "score": 50, "fullMark": 100},
+                {"subject": "市场情绪 (Sentiment)", "score": 50, "fullMark": 100},
             ]
         
         if not weights:
+            # 无数据时使用均等分配（5个策略各20%）
             weights = [
-                {"name": "双均线 (MA)", "value": 0, "fill": "#3b82f6"},
-                {"name": "RSI 振荡器", "value": 0, "fill": "#8b5cf6"},
-                {"name": "MACD 信号", "value": 0, "fill": "#10b981"},
-                {"name": "布林带 (BOLL)", "value": 0, "fill": "#06b6d4"},
-                {"name": "ATR 趋势", "value": 0, "fill": "#f43f5e"},
+                {"name": "双均线 (MA)", "value": 20, "fill": "#3b82f6"},
+                {"name": "RSI 振荡器", "value": 20, "fill": "#8b5cf6"},
+                {"name": "MACD 信号", "value": 20, "fill": "#10b981"},
+                {"name": "布林带 (BOLL)", "value": 20, "fill": "#06b6d4"},
+                {"name": "ATR 趋势", "value": 20, "fill": "#f43f5e"},
             ]
         
         last_updated = latest_date.isoformat() if latest_date else datetime.now(timezone.utc).isoformat()
@@ -721,28 +833,30 @@ async def get_status(db: AsyncSession = Depends(get_db_session)):
             weights=weights,
             lastUpdated=last_updated,
             activeCount=active_count,
+            hibernatingCount=hibernating_count,
             totalAllocation=total_allocation
         )
         
     except Exception as e:
-        logger.error(f"Error fetching status: {e}")
-        # 返回默认空结构而非报错
+        logger.error(f"Error fetching status: {e}", exc_info=True)
+        # 返回合理的默认结构而非报错（与前端 MOCK_DATA 格式一致）
         return StatusResponse(
             dimensions=[
-                {"subject": "动量 (Momentum)", "score": 0, "fullMark": 100},
-                {"subject": "均值回归 (Reversion)", "score": 0, "fullMark": 100},
-                {"subject": "波动率 (Volatility)", "score": 0, "fullMark": 100},
-                {"subject": "成交量 (Volume)", "score": 0, "fullMark": 100},
-                {"subject": "市场情绪 (Sentiment)", "score": 0, "fullMark": 100},
+                {"subject": "动量 (Momentum)", "score": 50, "fullMark": 100},
+                {"subject": "均值回归 (Reversion)", "score": 50, "fullMark": 100},
+                {"subject": "波动率 (Volatility)", "score": 50, "fullMark": 100},
+                {"subject": "成交量 (Volume)", "score": 50, "fullMark": 100},
+                {"subject": "市场情绪 (Sentiment)", "score": 50, "fullMark": 100},
             ],
             weights=[
-                {"name": "双均线 (MA)", "value": 0, "fill": "#3b82f6"},
-                {"name": "RSI 振荡器", "value": 0, "fill": "#8b5cf6"},
-                {"name": "MACD 信号", "value": 0, "fill": "#10b981"},
-                {"name": "布林带 (BOLL)", "value": 0, "fill": "#06b6d4"},
-                {"name": "ATR 趋势", "value": 0, "fill": "#f43f5e"},
+                {"name": "双均线 (MA)", "value": 20, "fill": "#3b82f6"},
+                {"name": "RSI 振荡器", "value": 20, "fill": "#8b5cf6"},
+                {"name": "MACD 信号", "value": 20, "fill": "#10b981"},
+                {"name": "布林带 (BOLL)", "value": 20, "fill": "#06b6d4"},
+                {"name": "ATR 趋势", "value": 20, "fill": "#f43f5e"},
             ],
             lastUpdated=datetime.now(timezone.utc).isoformat(),
             activeCount=0,
+            hibernatingCount=0,
             totalAllocation=100000
         )

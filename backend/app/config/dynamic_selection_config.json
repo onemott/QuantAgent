@@ -9,5 +9,8 @@
     "risk_score": 0.2,
     "stability_score": 0.2,
     "efficiency_score": 0.2
-  }
+  },
+  "revival_score_threshold": 45.0,
+  "min_consecutive_high": 2,
+  "max_revival_per_round": 2
 }

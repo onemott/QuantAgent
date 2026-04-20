@@ -77,6 +77,7 @@ class VectorizedBacktester:
         # 8. Equity Curve
         # Cumulative product of (1 + net_return)
         equity_curve = self.initial_capital * (1 + net_returns).cumprod()
+        equity_curve = equity_curve.clip(lower=0.0)  # 防止权益曲线变为负值
 
         # 9. Metrics Calculation
         if len(position) > 0:

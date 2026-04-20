@@ -232,6 +232,16 @@ const INTERVALS = [
   { value: "1d",  label: "1天" },
 ];
 
+// Interval 到分钟的映射（用于计算 evaluation_period）
+const INTERVAL_MINUTES: Record<string, number> = {
+  "1m": 1,
+  "5m": 5,
+  "15m": 15,
+  "1h": 60,
+  "4h": 240,
+  "1d": 1440,
+};
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function ReplayPage() {
   return (
@@ -345,7 +355,14 @@ function ReplayContentWithHydrationFix() {
     low_score_threshold: 30.0,
     min_strategies: 2,
   });
+  const [revivalRule, setRevivalRule] = useState({
+    revival_score_threshold: 45,
+    min_consecutive_high: 2,
+    max_revival_per_round: 2,
+  });
   const [perStrategyCapital, setPerStrategyCapital] = useState<number | undefined>(undefined);
+  // 标记 evaluation_period 是否被手动修改过
+  const [isEvalPeriodManual, setIsEvalPeriodManual] = useState(false);
 
   // Dynamic Selection History Data (shared between EliminationHistory and WeightEvolutionChart)
   const [dynamicSelectionHistory, setDynamicSelectionHistory] = useState<DynamicSelectionHistoryRecord[]>([]);
@@ -482,6 +499,8 @@ function ReplayContentWithHydrationFix() {
     
     const end = new Date(maxDate);
     end.setHours(23, 59, 59, 999);
+    // 重置手动标记，允许自动计算新的 evaluation_period
+    setIsEvalPeriodManual(false);
     setInterval(preset.config.interval);
     setSpeed(preset.config.speed);
     setDateRange({ start: start.toISOString(), end: end.toISOString() });
@@ -499,6 +518,42 @@ function ReplayContentWithHydrationFix() {
       }
     }
   }, [selectedType, session]);
+
+
+
+  // 自动计算 evaluation_period
+  useEffect(() => {
+    // 如果用户手动修改过，不自动计算
+    if (isEvalPeriodManual) return;
+    
+    // 只在 dynamic_selection 策略类型下自动计算
+    if (selectedType !== "dynamic_selection") return;
+
+    const intervalMinutes = INTERVAL_MINUTES[interval];
+    if (!intervalMinutes) return;
+
+    const startDate = new Date(dateRange.start);
+    const endDate = new Date(dateRange.end);
+    
+    // 计算总分钟数
+    const totalMinutes = (endDate.getTime() - startDate.getTime()) / (1000 * 60);
+    if (totalMinutes <= 0) return;
+
+    // 计算总 K 线数量
+    const totalBars = Math.floor(totalMinutes / intervalMinutes);
+    if (totalBars <= 0) return;
+
+      // 目标是产生约 8 次评估（5~10 次的中间值）
+    let recommendedPeriod = Math.round(totalBars / 8);
+    
+    // 上限：不超过总 K 线数量的 80%，确保至少能触发初始评估
+    recommendedPeriod = Math.min(Math.floor(totalBars * 0.8), recommendedPeriod);
+    
+    // 下限：至少 50 根 K 线，避免评估过于频繁
+    recommendedPeriod = Math.max(50, recommendedPeriod);
+
+    setEvaluationPeriod(recommendedPeriod);
+  }, [interval, dateRange.start, dateRange.end, selectedType, isEvalPeriodManual]);
 
   // Clear toast after 3s
   useEffect(() => {
@@ -570,6 +625,8 @@ function ReplayContentWithHydrationFix() {
     // 根据策略类型推荐周期
     const recommended = STRATEGY_INTERVAL_MAP[selectedType];
     if (recommended) {
+      // 策略类型切换时重置手动标记，允许自动计算新的 evaluation_period
+      setIsEvalPeriodManual(false);
       setInterval(recommended.interval);
     }
   }, [selectedType, templates]);
@@ -614,6 +671,8 @@ function ReplayContentWithHydrationFix() {
             if (defaultStart < minDate) {
               defaultStart = new Date(minValidDate);
             }
+            // 日期范围重置时，允许自动计算新的 evaluation_period
+            setIsEvalPeriodManual(false);
             setDateRange({
               start: defaultStart.toISOString(),
               end: defaultEnd.toISOString()
@@ -660,6 +719,8 @@ function ReplayContentWithHydrationFix() {
     }
     
     if (needsAdjust) {
+      // 日期范围自动调整时，允许自动计算新的 evaluation_period
+      setIsEvalPeriodManual(false);
       setDateRange({
         start: newStart.toISOString(),
         end: newEnd.toISOString()
@@ -795,6 +856,7 @@ function ReplayContentWithHydrationFix() {
           weight_method: weightMethod,
           composition_threshold: compositionThreshold,
           elimination_rule: eliminationRule,
+          revival_rule: revivalRule,
           ...(perStrategyCapital ? { per_strategy_capital: perStrategyCapital } : {}),
         };
       } else {
@@ -1158,8 +1220,26 @@ function ReplayContentWithHydrationFix() {
 
     const fetchDynamicSelectionHistory = async (isPolling = false) => {
       const sessionId = safeSession?.replay_session_id;
+      const strategyType = safeSession?.strategy_type;
+      
+      // Debug: log session info
+      console.log('[DynamicSelectionHistory] fetchDynamicSelectionHistory called:', {
+        isPolling,
+        sessionId,
+        strategyType,
+        running,
+        hasSession: !!safeSession,
+      });
+      
       if (!sessionId) {
+        console.warn('[DynamicSelectionHistory] No sessionId available, skipping fetch');
         if (!isPolling) setDynamicSelectionHistory([]);
+        return;
+      }
+      
+      // Only fetch for dynamic_selection strategy type
+      if (strategyType !== 'dynamic_selection') {
+        console.log('[DynamicSelectionHistory] Strategy type is not dynamic_selection, skipping fetch');
         return;
       }
 
@@ -1174,6 +1254,10 @@ function ReplayContentWithHydrationFix() {
           return;
         }
         const data = await res.json();
+        console.log('[DynamicSelectionHistory] Fetched data:', {
+          recordCount: Array.isArray(data) ? data.length : 0,
+          isArray: Array.isArray(data),
+        });
         if (Array.isArray(data)) {
           setDynamicSelectionHistory(data);
         } else {
@@ -1191,7 +1275,10 @@ function ReplayContentWithHydrationFix() {
     fetchDynamicSelectionHistory();
     
     let intervalId: number | null = null;
-    if (running && safeSession?.replay_session_id) {
+    // Only poll when running AND strategy_type is dynamic_selection
+    const shouldPoll = running && safeSession?.strategy_type === 'dynamic_selection' && safeSession?.replay_session_id;
+    console.log('[DynamicSelectionHistory] Polling setup:', { shouldPoll, running, strategyType: safeSession?.strategy_type });
+    if (shouldPoll) {
       intervalId = window.setInterval(() => fetchDynamicSelectionHistory(true), 5000);
     }
     
@@ -1199,7 +1286,7 @@ function ReplayContentWithHydrationFix() {
       abortController.abort();
       if (intervalId) window.clearInterval(intervalId);
     };
-  }, [safeSession?.replay_session_id, running]);
+  }, [safeSession?.replay_session_id, safeSession?.strategy_type, running]);
 
   // Toggle save status
   const handleToggleSave = async (replaySessionId: string) => {
@@ -1730,14 +1817,29 @@ function ReplayContentWithHydrationFix() {
                       </span>
                     )}
                   </div>
-                  <DateRangePicker value={dateRange}onChange={setDateRange}validDates={validDates}quickRanges={generateQuickRanges(validDates, interval)}minDate={validDates && validDates.length > 0 ? new Date(validDates[0]) : null}maxDate={validDates && validDates.length > 0 ? new Date(validDates[validDates.length - 1]) : null}
+                  <DateRangePicker 
+                    value={dateRange}
+                    onChange={(newRange) => {
+                      setIsEvalPeriodManual(false);
+                      setDateRange(newRange);
+                    }}
+                    validDates={validDates}
+                    quickRanges={generateQuickRanges(validDates, interval)}
+                    minDate={validDates && validDates.length > 0 ? new Date(validDates[0]) : null}
+                    maxDate={validDates && validDates.length > 0 ? new Date(validDates[validDates.length - 1]) : null}
                   />
                 </div>
 
                 {/* Interval */}
                 <div>
                   <label className="text-xs text-slate-400 mb-1.5 block">K线周期</label>
-                  <Select value={interval} onValueChange={setInterval}>
+                  <Select 
+                    value={interval} 
+                    onValueChange={(value) => {
+                      setIsEvalPeriodManual(false);
+                      setInterval(value);
+                    }}
+                  >
                     <SelectTrigger className="w-full bg-slate-800 border-slate-700 text-slate-100 h-9 text-sm">
                       <SelectValue />
                     </SelectTrigger>
@@ -1892,16 +1994,23 @@ function ReplayContentWithHydrationFix() {
                 onChange={setAtomicStrategies}
                 templates={templates}
                 evaluationPeriod={evaluationPeriod}
-                onEvaluationPeriodChange={setEvaluationPeriod}
+                onEvaluationPeriodChange={(value) => {
+                  setIsEvalPeriodManual(true);
+                  setEvaluationPeriod(value);
+                }}
                 weightMethod={weightMethod}
                 onWeightMethodChange={setWeightMethod}
                 compositionThreshold={compositionThreshold}
                 onCompositionThresholdChange={setCompositionThreshold}
                 eliminationRule={eliminationRule}
                 onEliminationRuleChange={setEliminationRule}
+                revivalRule={revivalRule}
+                onRevivalRuleChange={setRevivalRule}
                 perStrategyCapital={perStrategyCapital}
                 onPerStrategyCapitalChange={setPerStrategyCapital}
                 interval={interval}
+                dateRange={dateRange}
+                isEvalPeriodManual={isEvalPeriodManual}
               />
             )}
             {/* Regular Strategy Params */}

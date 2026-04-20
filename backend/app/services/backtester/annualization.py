@@ -1,14 +1,18 @@
+import logging
 import math
 from typing import Optional
 
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
 
+logger = logging.getLogger(__name__)
+
 
 WEEKDAY_TRADING_DAYS_PER_YEAR = 252.0
 CONTINUOUS_TRADING_DAYS_PER_YEAR = 365.2425
 DEFAULT_ANNUALIZATION_FACTOR = 252
 DEFAULT_RISK_FREE_RATE = 0.02
+NUMERICAL_EPSILON = 1e-12
 
 
 def validate_datetime_index(index: pd.Index, name: str = "Backtest data") -> None:
@@ -38,6 +42,24 @@ def annualize_return(total_return_ratio: float, periods_observed: int, annualiza
         return 0.0
     if total_return_ratio <= -1.0:
         return -100.0
+    
+    # 短周期保护：观测周期不足时跳过年化计算
+    if periods_observed < 30:
+        logger.warning(
+            f"观测周期不足(periods={periods_observed}<30)，跳过年化，"
+            f"返回总收益率 {total_return_ratio * 100:.2f}%"
+        )
+        return total_return_ratio * 100
+    
+    # 年化倍数保护：避免极端放大
+    annualization_multiple = annualization_factor / periods_observed
+    if annualization_multiple > 10:
+        logger.warning(
+            f"年化倍数过大(multiple={annualization_multiple:.2f}>10)，跳过年化，"
+            f"返回总收益率 {total_return_ratio * 100:.2f}%"
+        )
+        return total_return_ratio * 100
+    
     return float(((1 + total_return_ratio) ** (annualization_factor / periods_observed) - 1) * 100)
 
 
@@ -48,7 +70,7 @@ def annualize_sharpe(returns: pd.Series, annualization_factor: int, risk_free_ra
     risk_free_per_period = risk_free_rate / annualization_factor
     excess_returns = returns - risk_free_per_period
     std = excess_returns.std()
-    if std <= 0 or math.isnan(std):
+    if std <= NUMERICAL_EPSILON or math.isnan(std):
         return 0.0
 
     return float((excess_returns.mean() / std) * math.sqrt(annualization_factor))

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useMemo } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -126,6 +127,10 @@ export default function StrategyMonitorPage() {
   const [simulateTarget, setSimulateTarget] = useState<StrategyDetail | null>(null);
   const [simulateDialogOpen, setSimulateDialogOpen] = useState(false);
 
+  // Get session_id from URL query parameter for replay session filtering
+  const searchParams = useSearchParams();
+  const sessionId = searchParams.get("session_id") || undefined;
+
   // Calculate strategy details with scores and rankings
   const strategyDetails: StrategyDetail[] = useMemo(() => {
     if (!data) return [];
@@ -164,18 +169,39 @@ export default function StrategyMonitorPage() {
     setLoading(true);
     setError(null);
     try {
+      // Build URL with optional session_id filter
+      const params = new URLSearchParams();
+      if (sessionId) {
+        params.set("session_id", sessionId);
+      }
+      const queryString = params.toString();
+      const url = `/api/v1/dynamic-selection/status${queryString ? `?${queryString}` : ""}`;
+
       // 使用相对路径请求动态选择数据
-      const res = await fetch("/api/v1/dynamic-selection/status");
+      const res = await fetch(url);
       if (!res.ok) {
-        throw new Error("Failed to fetch monitor data");
+        throw new Error(`服务器返回 ${res.status}`);
       }
       const jsonData = await res.json();
+
+      // Check if response is empty or has no dimensions
+      if (!jsonData || (Array.isArray(jsonData.dimensions) && jsonData.dimensions.length === 0)) {
+        setData(null);
+        setError("暂无评估数据，请先运行包含动态选择策略的回放");
+        return;
+      }
+
       setData(jsonData);
     } catch (err) {
-      console.warn("API request failed, using mock data for preview", err);
+      console.warn("API request failed:", err);
+      // Check if it's a network/connection error
+      if (err instanceof TypeError && err.message.includes("fetch")) {
+        setError("后端服务未连接，请检查后端服务是否正常运行");
+      } else {
+        setError(`后端接口尚未就绪：${err instanceof Error ? err.message : "未知错误"}`);
+      }
       // Fallback to mock data for UI demonstration
       setData(MOCK_DATA);
-      setError("后端接口尚未就绪，当前显示模拟数据");
     } finally {
       setLoading(false);
     }
@@ -246,7 +272,7 @@ export default function StrategyMonitorPage() {
     // 模拟实时更新
     const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [sessionId]); // Re-fetch when sessionId changes
 
   return (
     <div className="min-h-screen bg-[#0a0e1a] text-slate-100">
@@ -582,7 +608,7 @@ export default function StrategyMonitorPage() {
         </Card>
 
         {/* ── Elimination History ── */}
-        <EliminationHistory />
+        <EliminationHistory sessionId={sessionId} />
       </main>
 
       {/* ── Evaluate Confirmation Dialog ── */}

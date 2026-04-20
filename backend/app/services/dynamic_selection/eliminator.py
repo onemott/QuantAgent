@@ -34,8 +34,59 @@ class EliminationRule:
                 f"min_strategies must be >= 1, got {self.min_strategies}"
             )
 
+
+@dataclass
+class RevivalRule:
+    """休眠策略复活规则"""
+    revival_score_threshold: float = 45.0  # 复活评分阈值（略高于淘汰阈值40，防止频繁切换）
+    min_consecutive_high: int = 2  # 连续高于阈值的轮次数
+    max_revival_per_round: int = 2  # 每轮最多复活策略数
+
 class StrategyEliminator:
     """策略淘汰器：执行末位淘汰机制"""
+
+    def apply_soft_elimination(
+        self,
+        ranked_strategies: List[RankedStrategy],
+        rule: EliminationRule,
+        consecutive_low_counts: Dict[str, int] = None,
+        regime_alignment: Dict[str, bool] = None,
+    ) -> Tuple[List[RankedStrategy], List[RankedStrategy], Dict[str, str]]:
+        consecutive_low_counts = consecutive_low_counts or {}
+        regime_alignment = regime_alignment or {}
+
+        surviving = []
+        eliminated = []
+        reasons = {}
+
+        for rs in ranked_strategies:
+            consecutive_low = consecutive_low_counts.get(rs.strategy_id, 0)
+            is_absolute_low = rs.score < rule.min_score_threshold
+            is_consecutive_extreme = consecutive_low >= rule.min_consecutive_low
+            is_regime_mismatch = not regime_alignment.get(rs.strategy_id, True)
+
+            if is_absolute_low and is_consecutive_extreme and is_regime_mismatch:
+                eliminated.append(rs)
+                reasons[rs.strategy_id] = (
+                    f"Extreme weak score ({rs.score:.2f}) with {consecutive_low} consecutive low rounds "
+                    "and regime mismatch"
+                )
+                continue
+
+            surviving.append(rs)
+
+        if len(surviving) < rule.min_strategies:
+            eliminated.sort(key=lambda x: x.score, reverse=True)
+            need_restore = min(rule.min_strategies - len(surviving), len(eliminated))
+            restored = eliminated[:need_restore]
+            surviving.extend(restored)
+            eliminated = eliminated[need_restore:]
+            for rs in restored:
+                reasons.pop(rs.strategy_id, None)
+
+        surviving.sort(key=lambda x: x.score, reverse=True)
+        eliminated.sort(key=lambda x: x.score, reverse=True)
+        return surviving, eliminated, reasons
 
     def apply_elimination(
         self,
@@ -103,3 +154,47 @@ class StrategyEliminator:
         eliminated.sort(key=lambda x: x.score, reverse=True)
         
         return surviving, eliminated, reasons
+
+    @staticmethod
+    def check_revival(
+        hibernating_scores: Dict[str, float],
+        consecutive_high_counts: Dict[str, int],
+        rule: RevivalRule
+    ) -> Tuple[List[str], Dict[str, int], Dict[str, str]]:
+        """
+        检查休眠策略是否满足复活条件。
+
+        Args:
+            hibernating_scores: 休眠策略的当前评分
+            consecutive_high_counts: 各休眠策略连续高分计数
+            rule: 复活规则
+
+        Returns:
+            (revived_ids, updated_counts, revival_reasons)
+            - revived_ids: 可复活的策略ID列表
+            - updated_counts: 更新后的连续高分计数
+            - revival_reasons: 复活原因字典 {strategy_id: reason_string}
+        """
+        updated_counts = consecutive_high_counts.copy()
+        revival_candidates = []
+
+        for strategy_id, score in hibernating_scores.items():
+            if score >= rule.revival_score_threshold:
+                updated_counts[strategy_id] = updated_counts.get(strategy_id, 0) + 1
+            else:
+                updated_counts[strategy_id] = 0
+
+            count = updated_counts[strategy_id]
+            if count >= rule.min_consecutive_high:
+                revival_candidates.append((strategy_id, score, count))
+
+        revival_candidates.sort(key=lambda x: x[1], reverse=True)
+        selected = revival_candidates[:rule.max_revival_per_round]
+
+        revived_ids = [s[0] for s in selected]
+        revival_reasons = {
+            s[0]: f"Score ({s[1]:.2f}) above revival threshold ({rule.revival_score_threshold}) for {s[2]} consecutive rounds"
+            for s in selected
+        }
+
+        return revived_ids, updated_counts, revival_reasons
