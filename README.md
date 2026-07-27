@@ -45,7 +45,7 @@ Ensure that Docker and Docker Compose are installed on your system.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourusername/QuantAgent.git
+git clone https://github.com/onemott/QuantAgent.git
 cd QuantAgent
 
 # 2. Configure environment variables
@@ -102,7 +102,7 @@ QuantAgent OS 是一个模块化、高性能的量化交易操作系统。该项
 
 ```bash
 # 1. 克隆代码仓库
-git clone https://github.com/yourusername/QuantAgent.git
+git clone https://github.com/onemott/QuantAgent.git
 cd QuantAgent
 
 # 2. 配置根目录环境变量
